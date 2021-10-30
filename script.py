@@ -1,18 +1,21 @@
-import json
-
 # ListingAnalyzer takes in a json of raw listings and produces a list of Listing, each of which
 # contains a list of Scenario.
-
-class Listing(object):
-  raw_listing: dict
-
-  def __init__(self, raw_listing: dict):
-    self.raw_listing = raw_listing
-
+import json
 
 Percentage = float
 DollarAmount = float
 Year = int
+
+def load_from_file(filename: str) -> dict:
+  with open(filename) as json_file:
+    return json.load(json_file)
+
+
+# expects a json in the format returned by
+# https://www.zillow.com/search/GetSearchPageState.htm?searchQueryState=<query>
+def extract_raw_listings(json: dict) -> list[dict]:
+  return json["cat1"]["searchResults"]["listResults"] + json["cat1"][
+      "searchResults"]["mapResults"]
 
 # list[DollarAmount][n-1] = 50th percentile revenue for the nth month of the year
 revenue_destin_50: dict[str, list[DollarAmount]] = {
@@ -26,124 +29,109 @@ revenue_destin_50: dict[str, list[DollarAmount]] = {
     [2160, 3718, 5342, 4050, 6516, 11876, 13974, 8294, 6489, 6189, 3531, 2571]
 }
 
+class Listing(object):
+  raw_listing: dict
 
-def load_from_file(filename: str) -> dict:
-  with open(filename) as json_file:
-    return json.load(json_file)
+  def __init__(self, raw_listing: dict):
+    self.raw_listing = raw_listing
 
+  def get_price(self) -> DollarAmount:
+    try:
+      # print(f"trying unformattedPrice on raw_listing")
+      # print(raw_listing)
+      return DollarAmount(self.raw_listing["unformattedPrice"])
+    except KeyError as e:
+      # print(f"couldn't find unformattedPrice so trying hpdDate on self.raw_listing")
+      # print(self.raw_listing)
+      # TODO: figure out how to suppress the error here.
+      return DollarAmount(self.raw_listing["hdpData"]["homeInfo"]["priceForHDP"])
 
-# expects a json in the format returned by
-# https://www.zillow.com/search/GetSearchPageState.htm?searchQueryState=<query>
-def extract_raw_listings(json: dict) -> list[dict]:
-  return json["cat1"]["searchResults"]["listResults"] + json["cat1"][
-      "searchResults"]["mapResults"]
-
-def get_price(raw_listing: dict) -> DollarAmount:
-  try:
-    # print(f"trying unformattedPrice on raw_listing")
-    # print(raw_listing)
-    return DollarAmount(raw_listing["unformattedPrice"])
-  except KeyError as e:
-    # print(f"couldn't find unformattedPrice so trying hpdDate on raw_listing")
-    # print(raw_listing)
-    # TODO: figure out how to suppress the error here.
-    return DollarAmount(raw_listing["hdpData"]["homeInfo"]["priceForHDP"])
-
-
-def calc_down_payment(raw_listing: dict,
+  def calc_down_payment(self,
                       percent_down: Percentage = 5) -> DollarAmount:
-  return get_price(raw_listing) * (percent_down / 100)
+    return self.get_price() * (percent_down / 100)
 
+    # Highly variable, 3% is standard rule of thumb.
+  def calc_closing_cost(self, estimate: Percentage = 3) -> DollarAmount:
+    return self.get_price() * (estimate / 100)
 
-# Highly variable, 3% is standard rule of thumb.
-def calc_closing_cost(raw_listing: dict, estimate: Percentage = 3) -> DollarAmount:
-  return get_price(raw_listing) * (estimate / 100)
+  # Highly variable, an old house will be far more than 2%. 5-10k is another rule of thumb for this price range.
+  def calc_immediate_repairs(self,
+                            estimate: Percentage = 2) -> DollarAmount:
+    return self.get_price() * (estimate / 100)
 
+  # Highly variable rule of thumb for partially furnished place.
+  def calc_furninshing_cost(self) -> DollarAmount:
+    return 10000
 
-# Highly variable, an old house will be far more than 2%. 5-10k is another rule of thumb for this price range.
-def calc_immediate_repairs(raw_listing: dict,
-                           estimate: Percentage = 2) -> DollarAmount:
-  return get_price(raw_listing) * (estimate / 100)
-
-
-# Highly variable rule of thumb for partially furnished place.
-def calc_furninshing_cost() -> DollarAmount:
-  return 10000
-
-
-def calc_monthly_mortgage_payment(raw_listing: dict,
+  def calc_monthly_mortgage_payment(self,
                                   yearly_rate: Percentage,
                                   down_payment: DollarAmount,
                                   mortgage_length: Year = 30) -> DollarAmount:
 
-  # calculates the monthly mortgage payment based on the price of the home and rate/length of the mortgage.
-  # M = p [ r(1 + r)^n ] / [ (1 + r)^n – 1]
-  # M = monthly mortgage payment
-  # p = the principal amount
-  # r = your monthly interest rate. Your lender likely lists interest rates as an annual figure, so you’ll need to divide by 12, for each month of the year. So, if your rate is 5%, then the monthly rate will look like this: 0.05/12 = 0.004167.
-  # n = the number of payments over the life-span of the loan. If you take out a 30-year fixed rate mortgage, this means:- n = 30 years x 12 months per year, or 360 payments.
-  def _calc_monthly_payment(p: DollarAmount, yearly_rate: Percentage,
-                            mortgage_length: Year) -> DollarAmount:
-    n = mortgage_length * 12
-    r = yearly_rate / 100.0 / 12.0
+    # calculates the monthly mortgage payment based on the price of the home and rate/length of the mortgage.
+    # M = p [ r(1 + r)^n ] / [ (1 + r)^n – 1]
+    # M = monthly mortgage payment
+    # p = the principal amount
+    # r = your monthly interest rate. Your lender likely lists interest rates as an annual figure, so you’ll need to divide by 12, for each month of the year. So, if your rate is 5%, then the monthly rate will look like this: 0.05/12 = 0.004167.
+    # n = the number of payments over the life-span of the loan. If you take out a 30-year fixed rate mortgage, this means:- n = 30 years x 12 months per year, or 360 payments.
+    def _calc_monthly_payment(p: DollarAmount, yearly_rate: Percentage,
+                              mortgage_length: Year) -> DollarAmount:
+      n = mortgage_length * 12
+      r = yearly_rate / 100.0 / 12.0
 
-    return p * (r * (1 + r)**n) / ((1 + r)**n - 1)
+      return p * (r * (1 + r)**n) / ((1 + r)**n - 1)
 
-  p = get_price(raw_listing) - down_payment
+    p = self.get_price() - down_payment
 
-  return _calc_monthly_payment(p, yearly_rate, mortgage_length)
+    return _calc_monthly_payment(p, yearly_rate, mortgage_length)
 
+  def calc_monthly_utilities(self) -> DollarAmount:
+    return 300
 
-def calc_monthly_utilities() -> DollarAmount:
-  return 300
+  # Rod and Alicia are at $4/night for coffee, netflix, popcorn, shampoo, tp
+  def calc_monthly_amenities(self, occupancy_rate: Percentage = 100) -> DollarAmount:
+    return (occupancy_rate / 100) * 30
 
+  # Estimate of monthly cash to go towards big repairs
+  def calc_monthly_capex(self,
+                        yearly_rate: Percentage = 1.25) -> DollarAmount:
+    return self.get_price() * (yearly_rate / 100) / 12
 
-# Rod and Alicia are at $4/night for coffee, netflix, popcorn, shampoo, tp
-def calc_monthly_amenities(occupancy_rate: Percentage = 100) -> DollarAmount:
-  return (occupancy_rate / 100) * 30
+  # Estimate of monthly cash to go towards small repairs and such
+  def calc_monthly_maintenance(self,
+                              yearly_rate: Percentage = 0.5) -> DollarAmount:
+    return self.get_price() * (yearly_rate / 100) / 12
 
-
-# Estimate of monthly cash to go towards big repairs
-def calc_monthly_capex(raw_listing: dict,
-                       yearly_rate: Percentage = 1.25) -> DollarAmount:
-  return get_price(raw_listing) * (yearly_rate / 100) / 12
-
-
-# Estimate of monthly cash to go towards small repairs and such
-def calc_monthly_maintenance(raw_listing: dict,
-                             yearly_rate: Percentage = 0.5) -> DollarAmount:
-  return get_price(raw_listing) * (yearly_rate / 100) / 12
-
-
-# Calculate property taxes
-# .83 is FL average according to smartasset
-def calc_monthly_property_taxes(raw_listing: dict,
-                                rate: Percentage = 0.83) -> DollarAmount:
-  return get_price(raw_listing) * (rate / 100) / 12
+  # Calculate property taxes
+  # .83 is FL average according to smartasset
+  def calc_monthly_property_taxes(self,
+                                  rate: Percentage = 0.83) -> DollarAmount:
+    return self.get_price() * (rate / 100) / 12
 
 
-def calc_avg_monthly_revenue(raw_listing: dict) -> DollarAmount:
-  monthly_rev_list = revenue_destin_50[
-      f"{int(raw_listing['hdpData']['homeInfo']['bedrooms'])} Bedroom"]
-  avg_monthly_rev = sum(monthly_rev_list) / len(monthly_rev_list)
-  sans_airbnb_fee = avg_monthly_rev - (avg_monthly_rev * (3 / 100))
-  return sans_airbnb_fee
+  def calc_avg_monthly_revenue(self) -> DollarAmount:
+    monthly_rev_list = revenue_destin_50[
+        f"{int(raw_listing['hdpData']['homeInfo']['bedrooms'])} Bedroom"]
+    avg_monthly_rev = sum(monthly_rev_list) / len(monthly_rev_list)
+    sans_airbnb_fee = avg_monthly_rev - (avg_monthly_rev * (3 / 100))
+    return sans_airbnb_fee
 
 
-def calc_monthly_management_fee(monthly_revenue: DollarAmount,
-                                rate: Percentage = 30) -> DollarAmount:
-  return monthly_revenue * (rate / 100)
+  def calc_monthly_management_fee(self, monthly_revenue: DollarAmount,
+                                  rate: Percentage = 30) -> DollarAmount:
+    return monthly_revenue * (rate / 100)
 
 
 if __name__ == '__main__':
   raw_listings = extract_raw_listings(load_from_file('east_of_pensacola.json'))
   for raw_listing in raw_listings:
     try:
+      listing = Listing(raw_listing)
       # up front
-      down_payment = calc_down_payment(raw_listing, 5)
-      closing_cost = calc_closing_cost(raw_listing, 3)
-      immediate_repairs = calc_immediate_repairs(raw_listing, 3)
-      furnishing_cost = calc_furninshing_cost()
+      down_payment = listing.calc_down_payment(5)
+      closing_cost = listing.calc_closing_cost(3)
+      immediate_repairs = listing.calc_immediate_repairs(3)
+      furnishing_cost = listing.calc_furninshing_cost()
 
       print(f'For a home asking for: {raw_listing["price"]}')
       print(f'You would expect a down payment: ${down_payment}')
@@ -155,23 +143,23 @@ if __name__ == '__main__':
 
       # recurring (monthly)
       # utilities -- $300
-      utilities = calc_monthly_utilities()
+      utilities = listing.calc_monthly_utilities()
       print(f'Estimate monthly utilities at ${utilities}')
       # amenities -- $4/night for coffee, netflix, popcorn, shampoo, tp
-      amenities = calc_monthly_amenities()
+      amenities = listing.calc_monthly_amenities()
       print(f'Monthly amenities at ${amenities}')
       # big repairs (capex) -- 1.25% of the property value per year
-      repairs = calc_monthly_capex(raw_listing)
+      repairs = listing.calc_monthly_capex()
       print(f'Put aside ${repairs} a month for repairs')
       # small repairs (maintenance) -- 0.5% of the property value per year
-      maintenance = calc_monthly_maintenance(raw_listing)
+      maintenance = listing.calc_monthly_maintenance()
       print(f'And ${maintenance} a month for maintenance')
       # hoa -- depends, but would eliminate the repairs and amenities potentially
       # taxes -- find some programatic way to do it based on location
-      taxes = calc_monthly_property_taxes(raw_listing)
+      taxes = listing.calc_monthly_property_taxes()
       print(f'Paying monthly property taxes of ${taxes}')
       # mortgage
-      mortgage = calc_monthly_mortgage_payment(raw_listing, 3.23, 30)
+      mortgage = listing.calc_monthly_mortgage_payment(3.23, 30)
       print(f'And a monthly mortgage payment of ${mortgage}')
       # total
       total_monthly_expenses = utilities + amenities + repairs + maintenance + taxes + mortgage
@@ -179,11 +167,11 @@ if __name__ == '__main__':
 
       # income
       # https://theshorttermshop.com/emerald-coast-rental-data-2020/ (take off airbnb fee)
-      avg_monthly_rev = calc_avg_monthly_revenue(raw_listing)
+      avg_monthly_rev = listing.calc_avg_monthly_revenue()
       print(f"Then expect an average monthly revenue of ${avg_monthly_rev}")
 
       mgmt_rate: Percentage = 30
-      monthly_mgmt_fee = calc_monthly_management_fee(avg_monthly_rev,
+      monthly_mgmt_fee = listing.calc_monthly_management_fee(avg_monthly_rev,
                                                      mgmt_rate)
       print(
           f"Of which {mgmt_rate}% goes to a management fee: ${monthly_mgmt_fee}"
