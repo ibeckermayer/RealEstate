@@ -29,7 +29,12 @@ revenue_destin_50: dict[str, list[DollarAmount]] = {
     [2160, 3718, 5342, 4050, 6516, 11876, 13974, 8294, 6489, 6189, 3531, 2571]
 }
 
+
 class Listing(object):
+  '''
+  Listing wraps a raw listing and provides methods for calculating various
+  estimated costs and earnings of the given property.
+  '''
   raw_listing: dict
 
   def __init__(self, raw_listing: dict):
@@ -108,14 +113,14 @@ class Listing(object):
                                   rate: Percentage = 0.83) -> DollarAmount:
     return self.get_price() * (rate / 100) / 12
 
-
   def calc_avg_monthly_revenue(self) -> DollarAmount:
     monthly_rev_list = revenue_destin_50[
         f"{int(raw_listing['hdpData']['homeInfo']['bedrooms'])} Bedroom"]
     avg_monthly_rev = sum(monthly_rev_list) / len(monthly_rev_list)
-    sans_airbnb_fee = avg_monthly_rev - (avg_monthly_rev * (3 / 100))
-    return sans_airbnb_fee
+    return avg_monthly_rev
 
+  def calc_airbnb_fee(self, avg_monthly_rev: DollarAmount) -> DollarAmount:
+    return avg_monthly_rev * (3 / 100)
 
   def calc_monthly_management_fee(self, monthly_revenue: DollarAmount,
                                   rate: Percentage = 30) -> DollarAmount:
@@ -170,14 +175,17 @@ if __name__ == '__main__':
       avg_monthly_rev = listing.calc_avg_monthly_revenue()
       print(f"Then expect an average monthly revenue of ${avg_monthly_rev}")
 
+      airbnb_fee = listing.calc_airbnb_fee(avg_monthly_rev)
+      print(f"Of which {airbnb_fee} (3%) goes to Airbnb.")
+
       mgmt_rate: Percentage = 30
       monthly_mgmt_fee = listing.calc_monthly_management_fee(avg_monthly_rev,
                                                      mgmt_rate)
       print(
-          f"Of which {mgmt_rate}% goes to a management fee: ${monthly_mgmt_fee}"
+          f"And of which {mgmt_rate}% goes to a management fee: ${monthly_mgmt_fee}"
       )
 
-      avg_monthly_profit = avg_monthly_rev - total_monthly_expenses - monthly_mgmt_fee
+      avg_monthly_profit = avg_monthly_rev - total_monthly_expenses - airbnb_fee - monthly_mgmt_fee
       print(f"For an average monthly profit of ${avg_monthly_profit}")
       print(
           f"Meaning you'd make all your money back in {upfront_cost/avg_monthly_profit} months"
