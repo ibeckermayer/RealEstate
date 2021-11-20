@@ -35,7 +35,7 @@ revenue_destin_50: dict[str, list[DollarAmount]] = {
 
 
 @dataclass
-class ScenarioParams:
+class GenerateScenarioParams:
   prices: list[DollarAmount]
   down_payments: list[Percentage]
   yearly_mortgage_rates: list[Percentage]
@@ -55,8 +55,8 @@ class GetPriceError(Exception):
 
 class Listing(object):
   '''
-  Listing wraps a raw listing and provides methods for calculating various
-  estimated costs and earnings of the given property.
+  Listing wraps a raw listing and provides methods for calculating various estimated costs and earnings of the given property.
+  TODO: It creates a list of scenarios in self.scenarios when generate_scenarios(gen_scenario_params) is called.
   '''
   raw_listing: dict
 
@@ -149,7 +149,7 @@ class Listing(object):
                                   rate: Percentage = 30) -> DollarAmount:
     return monthly_revenue * (rate / 100)
 
-  def generate_scenarios(self, params: ScenarioParams):
+  def generate_scenarios(self, params: GenerateScenarioParams):
     for price in params.prices:
       for down_payment in params.down_payments:
         for yearly_mortgage_rate in params.yearly_mortgage_rates:
@@ -259,17 +259,17 @@ if __name__ == '__main__':
   for raw_listing in raw_listings:
     try:
       listing = Listing(raw_listing)
-      params = ScenarioParams(prices=[listing.get_price()],
-                              down_payments=[5],
-                              yearly_mortgage_rates=[3.23],
-                              closing_cost_rates=[3],
-                              immediate_repair_rates=[3],
-                              furnishing_costs=[10000],
-                              monthly_utility_costs=[300],
-                              nightly_amenities_costs=[4],
-                              yearly_capex_rates=[1.25],
-                              yearly_maintenance_rates=[0.5],
-                              monthly_management_rates=[30])
+      params = GenerateScenarioParams(prices=[listing.get_price()],
+                                      down_payments=[5],
+                                      yearly_mortgage_rates=[3.23],
+                                      closing_cost_rates=[3],
+                                      immediate_repair_rates=[3],
+                                      furnishing_costs=[10000],
+                                      monthly_utility_costs=[300],
+                                      nightly_amenities_costs=[4],
+                                      yearly_capex_rates=[1.25],
+                                      yearly_maintenance_rates=[0.5],
+                                      monthly_management_rates=[30])
       listing.generate_scenarios(params)
       successfully_analyzed += 1
     except GetPriceError:
@@ -286,3 +286,6 @@ if __name__ == '__main__':
   print(
       f'Of a total of {total_listings} listings, {successfully_analyzed} were successfully analyzed, {get_price_errors} had get_price errors, and {unknown_errors} had unknown errors.'
   )
+
+# TODO: You can create an analysis runner to encapsulate what's going on in main and keep track of errors (eventually logs) and such
+# TODO: You can create an object for holding analysis results (Listing.scenarios)
