@@ -1,6 +1,7 @@
 # ListingAnalyzer takes in a json of raw listings and produces a list of Listing, each of which
 # contains a list of Scenario.
 import json
+import traceback
 from dataclasses import dataclass
 
 Percentage = float
@@ -48,6 +49,10 @@ class ScenarioParams:
   monthly_management_rates: list[Percentage]
 
 
+class GetPriceError(Exception):
+  pass
+
+
 class Listing(object):
   '''
   Listing wraps a raw listing and provides methods for calculating various
@@ -62,8 +67,11 @@ class Listing(object):
     try:
       return DollarAmount(self.raw_listing["unformattedPrice"])
     except KeyError as e:
-      return DollarAmount(
-          self.raw_listing["hdpData"]["homeInfo"]["priceForHDP"])
+      try:
+        return DollarAmount(
+            self.raw_listing["hdpData"]["homeInfo"]["priceForHDP"])
+      except KeyError as e:
+        raise GetPriceError
 
   def calc_down_payment(self, percent_down: Percentage = 5) -> DollarAmount:
     return self.get_price() * (percent_down / 100)
@@ -240,7 +248,14 @@ class Listing(object):
 
 
 if __name__ == '__main__':
+  # Stat tracking variables
+  total_listings: int
+  successfully_analyzed = 0
+  get_price_errors = 0
+  unknown_errors = 0
+
   raw_listings = extract_raw_listings(load_from_file('east_of_pensacola.json'))
+  total_listings = len(raw_listings)
   for raw_listing in raw_listings:
     try:
       listing = Listing(raw_listing)
@@ -256,72 +271,18 @@ if __name__ == '__main__':
                               yearly_maintenance_rates=[0.5],
                               monthly_management_rates=[30])
       listing.generate_scenarios(params)
-      # # up front
-      # down_payment = listing.calc_down_payment(5)
-      # closing_cost = listing.calc_closing_cost(3)
-      # immediate_repairs = listing.calc_immediate_repairs(3)
-      # furnishing_cost = listing.calc_furninshing_cost()
-
-      # print(f'For a home asking for: {raw_listing["price"]}')
-      # print(f'You would expect a down payment: ${down_payment}')
-      # print(f'You would expect a closing cost: ${closing_cost}')
-      # print(f'You would expect a immediate repairs: ${immediate_repairs}')
-      # print(f'You would expect a furnishing cost: ${furnishing_cost}')
-      # upfront_cost = down_payment + closing_cost + immediate_repairs + furnishing_cost
-      # print(f'For a total upfront cost of: ${upfront_cost}')
-
-      # # recurring (monthly)
-      # # utilities -- $300
-      # utilities = listing.calc_monthly_utilities()
-      # print(f'Estimate monthly utilities at ${utilities}')
-      # # amenities -- $4/night for coffee, netflix, popcorn, shampoo, tp
-      # amenities = listing.calc_monthly_amenities()
-      # print(f'Monthly amenities at ${amenities}')
-      # # big repairs (capex) -- 1.25% of the property value per year
-      # repairs = listing.calc_monthly_capex()
-      # print(f'Put aside ${repairs} a month for repairs')
-      # # small repairs (maintenance) -- 0.5% of the property value per year
-      # maintenance = listing.calc_monthly_maintenance()
-      # print(f'And ${maintenance} a month for maintenance')
-      # # hoa -- depends, but would eliminate the repairs and amenities potentially
-      # # taxes -- find some programatic way to do it based on location
-      # taxes = listing.calc_monthly_property_taxes()
-      # print(f'Paying monthly property taxes of ${taxes}')
-      # # mortgage
-      # mortgage = listing.calc_monthly_mortgage_payment(3.23, 30)
-      # print(f'And a monthly mortgage payment of ${mortgage}')
-      # # total
-      # total_monthly_expenses = utilities + amenities + repairs + maintenance + taxes + mortgage
-      # print(f"For total monthly expenses of ${total_monthly_expenses}")
-
-      # # income
-      # # https://theshorttermshop.com/emerald-coast-rental-data-2020/ (take off airbnb fee)
-      # avg_monthly_rev = listing.calc_avg_monthly_revenue()
-      # print(f"Then expect an average monthly revenue of ${avg_monthly_rev}")
-
-      # airbnb_fee = listing.calc_airbnb_fee(avg_monthly_rev)
-      # print(f"Of which {airbnb_fee} (3%) goes to Airbnb.")
-
-      # mgmt_rate: Percentage = 30
-      # monthly_mgmt_fee = listing.calc_monthly_management_fee(
-      #     avg_monthly_rev, mgmt_rate)
-      # print(
-      #     f"And of which {mgmt_rate}% goes to a management fee: ${monthly_mgmt_fee}"
-      # )
-
-      # avg_monthly_profit = avg_monthly_rev - total_monthly_expenses - airbnb_fee - monthly_mgmt_fee
-      # print(f"For an average monthly profit of ${avg_monthly_profit}")
-      # print(
-      #     f"Meaning you'd make all your money back in {upfront_cost/avg_monthly_profit} months"
-      # )
-      # print()
-    except KeyError as key:
-      # TODO
-      # print(f'Recieved key error for key {key} on raw_listing below:')
-      # print(raw_listing)
-      # print()
-      print('caught KeyError')
+      successfully_analyzed += 1
+    except GetPriceError:
+      print('get_price error, aborting')
       print()
+      get_price_errors += 1
+      continue
+    except Exception:
+      print('unknown exception, aborting')
+      print()
+      unknown_errors += 1
       continue
 
-print(len(raw_listings))
+  print(
+      f'Of a total of {total_listings} listings, {successfully_analyzed} were successfully analyzed, {get_price_errors} had get_price errors, and {unknown_errors} had unknown errors.'
+  )
