@@ -1,4 +1,5 @@
 import json
+import logging
 import requests
 from selenium import webdriver
 from selenium.common.exceptions import NoSuchElementException
@@ -18,6 +19,9 @@ GECKO_DRIVER_PATH = './geckodriver'
 Percentage = float
 DollarAmount = float
 Year = int
+
+logging.basicConfig(level=logging.INFO,
+                    format="%(levelname)s:%(funcName)s:%(message)s")
 
 
 @dataclass
@@ -68,11 +72,16 @@ class Listing:
 
     TODO: multi family info may be laid out differently i.e.: https://www.compass.com/listing/1050-palafox-drive-northeast-atlanta-ga-30324/845726107540165857/
     '''
+    logging.debug(f"Attempting to extract unit information")
     raw_units = []
 
     for detail in self.raw_listing['detailedInfo']['listingDetails']:
+      logging.debug(f"Examining detail: {detail}")
       if detail.get('name') == 'Unit Information':
         raw_units = detail['subCategories']
+        logging.debug(
+            f"Found the 'Unit Information' detail, attempting to extract units from raw_units: {raw_units}"
+        )
 
     units: list[Unit] = []
     for raw_unit in raw_units:
@@ -82,13 +91,14 @@ class Listing:
         if 'Baths' in field['key']:
           pass
           if 'Half' in field['key']:
+            logging.debug(f"Interpreting {field['key']} as half bath")
             baths += 0.5 * float(field['values'][0])
           else:
+            logging.debug(f"Interpreting {field['key']} as full bath")
             baths += int(field['values'][0])
         elif 'Bedrooms' in field['key']:
-          # beds = int(field['values'][0])
-          # TODO revert
-          beds = 0
+          logging.debug(f"Interpreting {field['key']} as bedroom")
+          beds = int(field['values'][0])
       units.append(Unit(beds, baths))
 
     return units
@@ -99,6 +109,7 @@ def from_raw(raw: str) -> Listing:
   from_raw takes in the raw webpage returned by an indivudal compass multi-family
   listing and extracts the raw listing information from the javascript.
   '''
+  logging.info("Extracting raw listing")
   return Listing(
       json.loads(
           raw.split("window.__PARTIAL_INITIAL_DATA__ = ")[1].split("</script>")
@@ -128,8 +139,10 @@ class RentEstimator(object):
     self.geckodriver = geckodriver
 
   def estimate(self, listing: Listing) -> list[RentEstimate]:
+    logging.info(f"Estimating the rents at {listing.pretty_address}")
     estimates: list[RentEstimate] = []
     for unit in listing.units:
+      logging.info(f"Estimating rent for unit: {unit}")
       try:
         # TODO: TOR process and the browser can both become contexts: https://twitter.com/POTUS/status/1469474907700477958
         # Sometimes if the TOR output node is known to Rentometer (or perhaps by some other mechanism),
@@ -137,13 +150,7 @@ class RentEstimator(object):
         # Keep restarting TOR and loading up Rentometer until we get a page where we can actually hit "Analyze".
         analyze_button_disabled = True
         while analyze_button_disabled:
-          try:
-            self.browser.close()
-            self.tor.kill()
-          except AttributeError:
-            # expect a AttributeError the first time this loops
-            pass
-
+          logging.info("Starting TOR...")
           # Start TOR and wait for it to boot up.
           # TODO: add a timeout here.
           self.tor = subprocess.Popen(TOR_PATH, stdout=subprocess.PIPE)
@@ -153,8 +160,10 @@ class RentEstimator(object):
           stdout: IO[bytes] = maybe_stdout
           while True:
             line = stdout.readline()
+            logging.debug(f"TOR startup output: {'{!r}'.format(line)}")
             if b"100% (done): Done" in line:
               break
+          logging.info(f"TOR started successfully")
 
           # Set up a browser proxied through TOR.
           options = Options()
@@ -162,14 +171,30 @@ class RentEstimator(object):
           options.set_preference('network.proxy.type', 1)
           options.set_preference('network.proxy.socks', '127.0.0.1')
           options.set_preference('network.proxy.socks_port', TOR_PORT)
+          logging.info(f"Opening browser...")
           self.browser = webdriver.Firefox(service=Service(self.geckodriver),
                                            options=options)
 
           # Connect to Rentometer and check if the analyze_button is disabled.
+          logging.info(f"Connecting to https://www.rentometer.com/")
           self.browser.get("https://www.rentometer.com/")
+          logging.info(f"https://www.rentometer.com/ connection succeeded")
+          logging.info(f"Checking if the \"Analyze\" button is enabled")
           analyze_button = self.browser.find_element_by_name("commit")
           analyze_button_disabled = analyze_button.get_attribute(
               "disabled") == "true"
+
+          # If the analyze button is disabled, kill the browser and TOR and try again.
+          if analyze_button_disabled:
+            logging.warning(
+                "The \"Analyze\" button was disabled. Killing the browser and TOR and trying again."
+            )
+            self.browser.close()
+            self.tor.kill()
+          else:
+            logging.info(
+                "The \"Analyze\" button is enabled, continuing to rental estimate"
+            )
 
         # We have the enabled analyze_button, now get the other html elements we'll need.
         address_box = self.browser.find_element_by_id(
@@ -181,42 +206,49 @@ class RentEstimator(object):
             self.browser.find_element_by_id("address_unified_search_baths"))
 
         address_box.send_keys(listing.pretty_address)
+        logging.info(f"Entered {listing.pretty_address} into the address box")
 
         beds_selector.select_by_value(str(
             unit.beds))  # "1" = 1 bed, "2" = 2 beds, etc.
+        logging.info(f"Selected {unit.beds} for \"Beds\"")
 
         # <option value="">Any</option>
         # <option value="1">1 Only</option>
         # <option value="1.5">1½ or more</option>
         if unit.baths == 1:
           baths_selector.select_by_value("1")
+          logging.info(f"Selected \"1 Only\" for \"Baths\"")
         elif unit.baths > 1:
           baths_selector.select_by_value("1.5")
+          logging.info(f"Selected \"1½ or more\" for \"Baths\"")
         else:
-          # TODO error
-          pass
-        # baths_selector.select_by_value("1.5")
+          raise ValueError(f"Unexpected number of baths: {unit.baths}")
 
         # Click analyze button to get analysis (typically opens a new page).
+        logging.info("Clicking the analyze button")
         analyze_button.click()
 
         # Check that rentometer was able to find enough results.
         try:
           if "Sorry, there are not enough results in that location to generate a valid analysis." in self.browser.find_element_by_xpath(
               "/html/body/div[3]/div").text:
-            # TODO: error handling
+            logging.error(
+                "\"Sorry, there are not enough results in that location to generate a valid analysis.\""
+            )
+            # TODO all the above logic should be wrapped in a try logic, if the exception that will be thrown here is caught then
+            # we should retry with "Any" baths.
             continue
         except NoSuchElementException:
           # This is the happy path.
-          pass
+          logging.info("Analysis succeeded")
 
         # Now we're on the analysis page.
         stats: list[WebElement] = self.browser.find_elements_by_class_name(
             "box-stats")
-        average: DollarAmount
-        median: DollarAmount
-        twenty_fifth_percentile: DollarAmount
-        seventy_fifth_percentile: DollarAmount
+        average: DollarAmount = 0
+        median: DollarAmount = 0
+        twenty_fifth_percentile: DollarAmount = 0
+        seventy_fifth_percentile: DollarAmount = 0
         setlocale(LC_NUMERIC, '')  # set to default locale
 
         def extract_dollar_value(stat: WebElement) -> DollarAmount:
@@ -232,17 +264,32 @@ class RentEstimator(object):
           elif '75TH PERCENTILE' in stat.text:
             seventy_fifth_percentile = extract_dollar_value(stat)
           else:
-            print("Something got fucked")  #TODO throw an error
+            logging.warning(f"Unexpected stat in stats box: {stat.text}")
 
-        estimates.append(
-            RentEstimate(unit, average, median, twenty_fifth_percentile,
-                         seventy_fifth_percentile))
+        if average == 0 or median == 0 or twenty_fifth_percentile == 0 or seventy_fifth_percentile == 0:
+          logging.error(
+              f"Could not extract stat from stats box: {[s.text for s in stats]}"
+          )
 
+        estimate = RentEstimate(unit, average, median, twenty_fifth_percentile,
+                                seventy_fifth_percentile)
+
+        logging.info(
+            f"Successfully created rent estimate for {listing.pretty_address}: {estimate}"
+        )
+
+        estimates.append(estimate)
       finally:
         # Close the browser and kill TOR.
-        # self.browser.close()
-        # self.proc.kill()
-        pass
+        logging.info("Closing the browser and killing TOR")
+        try:
+          self.browser.close()
+        except AttributeError:
+          pass
+        try:
+          self.tor.kill()
+        except AttributeError:
+          pass
 
     return estimates
 
@@ -251,8 +298,11 @@ if __name__ == '__main__':
   page = requests.get(
       "https://www.compass.com/listing/689-auburn-street-manchester-nh-03103/932977102909516985/"
   )
+
   listing = from_raw(page.text)
   re = RentEstimator()
   estimates = re.estimate(listing)
   for estimate in estimates:
     print(estimate)
+
+  exit(0)
