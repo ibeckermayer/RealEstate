@@ -1,6 +1,4 @@
-import json
-import logging
-import requests
+import json, logging, requests, subprocess, traceback, os
 from selenium import webdriver
 from selenium.common.exceptions import NoSuchElementException
 from selenium.webdriver.firefox.options import Options
@@ -8,19 +6,23 @@ from selenium.webdriver.firefox.service import Service
 from selenium.webdriver.support.ui import Select
 from selenium.webdriver.remote.webelement import WebElement
 from selenium.webdriver.common.desired_capabilities import DesiredCapabilities
+from googleapiclient.discovery import build
 from dataclasses import dataclass
 from locale import atof, setlocale, LC_NUMERIC
 from typing import IO, Tuple
-import subprocess
-import traceback
+
+Percentage = float
+DollarAmount = float
+Year = int
+
+SheetID = str
 
 TOR_PATH = "/usr/local/bin/tor"
 TOR_PORT = 9050
 GECKO_DRIVER_PATH = './geckodriver'
 
-Percentage = float
-DollarAmount = float
-Year = int
+GOOGLE_CREDENTIALS_FILE = 'real-estate-investing-335904-05fe8a22753f.json'
+GOOGLE_DRIVE_PARENT_FOLDER_ID = '1Ih91O9P0Uo46sdiRDIHFyMwGqnOnuKX2'
 
 logging.basicConfig(level=logging.INFO,
                     format="%(levelname)s:%(funcName)s:%(message)s")
@@ -330,8 +332,38 @@ class RentEstimator(object):
 
 
 # TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO
-class SpreadSheetBuilder(object):
-  pass
+class GoogleSheetBuilder(object):
+  '''
+  GOOGLE SHEETS API Read/Write Requests:
+  - 300 / minute
+  - ∞ / day
+  '''
+  def __init__(self, cred_file=GOOGLE_CREDENTIALS_FILE):
+    # Google api's use this as the default credential if no other is provided.
+    os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = cred_file
+
+  def create_spreadsheet(self,
+                         name: str,
+                         parent=GOOGLE_DRIVE_PARENT_FOLDER_ID) -> SheetID:
+    '''
+    Creates a new Google Spreadsheet under an existing parent folder,
+    returning the id of the newly created spreadsheet on success.
+    '''
+    service = build('drive', 'v3')
+    res = service.files().create(
+        body={
+            'name': name,
+            'parents': [parent],
+            'mimeType': 'application/vnd.google-apps.spreadsheet'
+        }).execute()
+
+    id = res.get('id')
+    if id is None:
+      raise Exception(
+          f"Received unexpected Google Drive API response when attempting to create a new Spreadsheet: {res}"
+      )
+
+    return id
 
 
 if __name__ == '__main__':
