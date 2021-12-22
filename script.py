@@ -7,10 +7,12 @@ from selenium.webdriver.firefox.options import Options
 from selenium.webdriver.firefox.service import Service
 from selenium.webdriver.support.ui import Select
 from selenium.webdriver.remote.webelement import WebElement
+from selenium.webdriver.common.desired_capabilities import DesiredCapabilities
 from dataclasses import dataclass
 from locale import atof, setlocale, LC_NUMERIC
-from typing import IO
+from typing import IO, Tuple
 import subprocess
+import traceback
 
 TOR_PATH = "/usr/local/bin/tor"
 TOR_PORT = 9050
@@ -137,66 +139,104 @@ class RentEstimator(object):
     self.browser: webdriver.Firefox
     self.tor: subprocess.Popen[bytes]
     self.geckodriver = geckodriver
+    self.estimates: list[RentEstimate]
+
+  # TODO: could become a RentometerBrowser class
+  def _get_unthrottled_tor_browser(
+      self) -> Tuple[subprocess.Popen[bytes], webdriver.Firefox]:
+    '''
+    Sometimes if the TOR output node is known to Rentometer (or perhaps by some other mechanism),
+    Rentometer will say that your free search limit is reached and the "Analyze" button will be inactive.
+    Keep restarting TOR and loading up Rentometer until we get a page where we can actually hit "Analyze".
+    '''
+    # Set up TOR proxy options.
+    options = Options()
+    options.headless = False  #TODO
+    options.set_preference('network.proxy.type', 1)
+    options.set_preference('network.proxy.socks', '127.0.0.1')
+    options.set_preference('network.proxy.socks_port', TOR_PORT)
+
+    # Set Selenium to become active as soon as the page becomes interactive,
+    # rather than waiting until it's fully loaded.
+    capabilities = DesiredCapabilities().FIREFOX
+    capabilities["pageLoadStrategy"] = "eager"
+
+    analyze_button_disabled = True
+    while analyze_button_disabled:
+      logging.info("Starting TOR...")
+      # Start TOR and wait for it to boot up.
+      # TODO: add a timeout here.
+      tor = subprocess.Popen(TOR_PATH, stdout=subprocess.PIPE)
+      maybe_stdout = tor.stdout
+      if maybe_stdout is None:
+        raise Exception("stdout was None")
+      stdout: IO[bytes] = maybe_stdout
+      while True:
+        line = stdout.readline()
+        logging.debug(f"TOR startup output: {'{!r}'.format(line)}")
+        if b"100% (done): Done" in line:
+          break
+      logging.info(f"TOR started successfully")
+
+      # Create a TOR browser
+      logging.info(f"Opening browser...")
+      browser = webdriver.Firefox(service=Service(self.geckodriver),
+                                  options=options,
+                                  capabilities=capabilities)
+
+      # Connect to Rentometer and check if the analyze_button is disabled.
+      logging.info(f"Connecting to https://www.rentometer.com/")
+      browser.get("https://www.rentometer.com/")
+      logging.info(f"https://www.rentometer.com/ connection succeeded")
+      logging.info(f"Checking if the \"Analyze\" button is enabled")
+      analyze_button = browser.find_element_by_name("commit")
+      analyze_button_disabled = analyze_button.get_attribute(
+          "disabled") == "true"
+
+      # If the analyze button is disabled, kill the browser and TOR and try again.
+      if analyze_button_disabled:
+        logging.warning(
+            "Opened Rentometer \"Analyze\" button was disabled. Killing the browser and TOR and trying again."
+        )
+        browser.close()
+        tor.kill()
+      else:
+        logging.info(
+            "Got a Rentometer browser with the \"Analyze\" button enabled.")
+
+    return (tor, browser)
+
+  def _nuke_tor_browser(self):
+    # Close the browser and kill TOR.
+    logging.info("Closing the browser and killing TOR")
+    try:
+      self.browser.close()
+    except AttributeError:
+      # self.browser wasn't set
+      pass
+    try:
+      self.tor.kill()
+    except AttributeError:
+      # self.tor wasn't set
+      pass
 
   def estimate(self, listing: Listing) -> list[RentEstimate]:
     logging.info(f"Estimating the rents at {listing.pretty_address}")
-    estimates: list[RentEstimate] = []
-    for unit in listing.units:
-      logging.info(f"Estimating rent for unit: {unit}")
-      try:
-        # TODO: TOR process and the browser can both become contexts: https://twitter.com/POTUS/status/1469474907700477958
-        # Sometimes if the TOR output node is known to Rentometer (or perhaps by some other mechanism),
-        # Rentometer will say that your free search limit is reached and the "Analyze" button will be inactive.
-        # Keep restarting TOR and loading up Rentometer until we get a page where we can actually hit "Analyze".
-        analyze_button_disabled = True
-        while analyze_button_disabled:
-          logging.info("Starting TOR...")
-          # Start TOR and wait for it to boot up.
-          # TODO: add a timeout here.
-          self.tor = subprocess.Popen(TOR_PATH, stdout=subprocess.PIPE)
-          maybe_stdout = self.tor.stdout
-          if maybe_stdout is None:
-            raise Exception("stdout was None")
-          stdout: IO[bytes] = maybe_stdout
-          while True:
-            line = stdout.readline()
-            logging.debug(f"TOR startup output: {'{!r}'.format(line)}")
-            if b"100% (done): Done" in line:
-              break
-          logging.info(f"TOR started successfully")
 
-          # Set up a browser proxied through TOR.
-          options = Options()
-          options.headless = False  #TODO
-          options.set_preference('network.proxy.type', 1)
-          options.set_preference('network.proxy.socks', '127.0.0.1')
-          options.set_preference('network.proxy.socks_port', TOR_PORT)
-          logging.info(f"Opening browser...")
-          self.browser = webdriver.Firefox(service=Service(self.geckodriver),
-                                           options=options)
+    self.estimates = []
+    self.tor, self.browser = self._get_unthrottled_tor_browser()
 
-          # Connect to Rentometer and check if the analyze_button is disabled.
-          logging.info(f"Connecting to https://www.rentometer.com/")
-          self.browser.get("https://www.rentometer.com/")
-          logging.info(f"https://www.rentometer.com/ connection succeeded")
-          logging.info(f"Checking if the \"Analyze\" button is enabled")
-          analyze_button = self.browser.find_element_by_name("commit")
-          analyze_button_disabled = analyze_button.get_attribute(
-              "disabled") == "true"
+    try:
+      for unit in listing.units:
+        logging.info(f"Estimating rent for unit: {unit}")
 
-          # If the analyze button is disabled, kill the browser and TOR and try again.
-          if analyze_button_disabled:
-            logging.warning(
-                "The \"Analyze\" button was disabled. Killing the browser and TOR and trying again."
-            )
-            self.browser.close()
-            self.tor.kill()
-          else:
-            logging.info(
-                "The \"Analyze\" button is enabled, continuing to rental estimate"
-            )
+        # Find the relevant UI elements
+        analyze_button = self.browser.find_element_by_name("commit")
+        if analyze_button.get_attribute("disabled") == "true":
+          # If rentometer is throttling our Analyze requests, kill the browser and TOR and reboot them until we can analyze again.
+          self._nuke_tor_browser()
+          self.tor, self.browser = self._get_unthrottled_tor_browser()
 
-        # We have the enabled analyze_button, now get the other html elements we'll need.
         address_box = self.browser.find_element_by_id(
             "address_unified_search_address")
         beds_selector = Select(
@@ -278,20 +318,20 @@ class RentEstimator(object):
             f"Successfully created rent estimate for {listing.pretty_address}: {estimate}"
         )
 
-        estimates.append(estimate)
-      finally:
-        # Close the browser and kill TOR.
-        logging.info("Closing the browser and killing TOR")
-        try:
-          self.browser.close()
-        except AttributeError:
-          pass
-        try:
-          self.tor.kill()
-        except AttributeError:
-          pass
+        self.estimates.append(estimate)
+    except Exception:
+      logging.error(
+          f"Unexpected error encountered while creating rent estimate: {traceback.format_exc()}"
+      )
+    finally:
+      self._nuke_tor_browser()
 
-    return estimates
+    return self.estimates
+
+
+# TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO
+class SpreadSheetBuilder(object):
+  pass
 
 
 if __name__ == '__main__':
