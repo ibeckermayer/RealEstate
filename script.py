@@ -1,4 +1,4 @@
-import json, logging, requests, subprocess, traceback, os
+import json, logging, requests, subprocess, traceback, os, enum
 from selenium import webdriver
 from selenium.common.exceptions import NoSuchElementException
 from selenium.webdriver.firefox.options import Options
@@ -9,20 +9,11 @@ from selenium.webdriver.common.desired_capabilities import DesiredCapabilities
 from googleapiclient.discovery import build
 from dataclasses import dataclass
 from locale import atof, setlocale, LC_NUMERIC
-from typing import IO, Tuple
-
-Percentage = float
-DollarAmount = float
-Year = int
-
-SheetID = str
-
-TOR_PATH = "/usr/local/bin/tor"
-TOR_PORT = 9050
-GECKO_DRIVER_PATH = './geckodriver'
-
-GOOGLE_CREDENTIALS_FILE = 'real-estate-investing-335904-05fe8a22753f.json'
-GOOGLE_DRIVE_PARENT_FOLDER_ID = '1Ih91O9P0Uo46sdiRDIHFyMwGqnOnuKX2'
+from typing import IO, Tuple, Any
+from gspread import service_account, Spreadsheet, Worksheet, WorksheetNotFound
+from pprint import pprint
+from constants import TOR_PATH, TOR_PORT, GECKO_DRIVER_PATH, GOOGLE_CREDENTIALS_FILE, REAL_ESTATE_FOLDER_ID
+from newtypes import Percentage, DollarAmount, Year, SpreadsheetID
 
 logging.basicConfig(level=logging.INFO,
                     format="%(levelname)s:%(funcName)s:%(message)s")
@@ -120,13 +111,26 @@ def from_raw(raw: str) -> Listing:
           [0].strip())['props']['listingRelation']['listing'])
 
 
+class EstimateType(enum.Enum):
+  '''
+  Descriptor of what type of estimate some estimate is.
+  '''
+  AVERAGE = 'average'
+  MEDIAN = 'median'
+  PERCENTILE_25 = "25th percentile"
+  PERCENTILE_75 = "75th percentile"
+
+
+@dataclass
+class RentEstimatedUnit:
+  unit: Unit
+  monthly_rent: DollarAmount
+
+
 @dataclass
 class RentEstimate:
-  unit: Unit
-  average: DollarAmount
-  median: DollarAmount
-  twenty_fifth_percentile: DollarAmount
-  seventy_fifth_percentile: DollarAmount
+  units: list[RentEstimatedUnit]
+  type: EstimateType
 
 
 class RentEstimator(object):
@@ -299,28 +303,46 @@ class RentEstimator(object):
         for stat in stats:
           if 'AVERAGE' in stat.text:
             average = extract_dollar_value(stat)
+            estimate = next(
+                (e for e in self.estimates if e.type == EstimateType.AVERAGE),
+                RentEstimate([], EstimateType.AVERAGE))
+            estimate.units.append(RentEstimatedUnit(unit, average))
+            if estimate not in self.estimates:
+              self.estimates.append(estimate)
           elif 'MEDIAN' in stat.text:
             median = extract_dollar_value(stat)
+            estimate = next(
+                (e for e in self.estimates if e.type == EstimateType.MEDIAN),
+                RentEstimate([], EstimateType.MEDIAN))
+            estimate.units.append(RentEstimatedUnit(unit, median))
+            if estimate not in self.estimates:
+              self.estimates.append(estimate)
           elif '25TH PERCENTILE' in stat.text:
             twenty_fifth_percentile = extract_dollar_value(stat)
+            estimate = next((e for e in self.estimates
+                             if e.type == EstimateType.PERCENTILE_25),
+                            RentEstimate([], EstimateType.PERCENTILE_25))
+            estimate.units.append(
+                RentEstimatedUnit(unit, twenty_fifth_percentile))
+            if estimate not in self.estimates:
+              self.estimates.append(estimate)
           elif '75TH PERCENTILE' in stat.text:
             seventy_fifth_percentile = extract_dollar_value(stat)
+            estimate = next((e for e in self.estimates
+                             if e.type == EstimateType.PERCENTILE_75),
+                            RentEstimate([], EstimateType.PERCENTILE_75))
+            estimate.units.append(
+                RentEstimatedUnit(unit, seventy_fifth_percentile))
+            if estimate not in self.estimates:
+              self.estimates.append(estimate)
           else:
             logging.warning(f"Unexpected stat in stats box: {stat.text}")
 
         if average == 0 or median == 0 or twenty_fifth_percentile == 0 or seventy_fifth_percentile == 0:
           logging.error(
-              f"Could not extract stat from stats box: {[s.text for s in stats]}"
+              f"Could not extract at least one stat from stats box: {[s.text for s in stats]}"
           )
 
-        estimate = RentEstimate(unit, average, median, twenty_fifth_percentile,
-                                seventy_fifth_percentile)
-
-        logging.info(
-            f"Successfully created rent estimate for {listing.pretty_address}: {estimate}"
-        )
-
-        self.estimates.append(estimate)
     except Exception:
       logging.error(
           f"Unexpected error encountered while creating rent estimate: {traceback.format_exc()}"
@@ -331,24 +353,73 @@ class RentEstimator(object):
     return self.estimates
 
 
-# TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO
-class GoogleSheetBuilder(object):
+class SpreadsheetBuilder(object):
   '''
+  Uses Google Sheets API to create and/or edit a spreadsheet.
+
   GOOGLE SHEETS API Read/Write Requests:
+  - 60 / user / minute
   - 300 / minute
   - ∞ / day
   '''
-  def __init__(self, cred_file=GOOGLE_CREDENTIALS_FILE):
+  class ValueInputOption(enum.Enum):
+    '''
+    Updates require a valid ValueInputOption parameter (for singular updates, this is a required query
+    parameter; for batch updates, this parameter is required in the request body)
+    '''
+
+    # The input is not parsed and is simply inserted as a string, so the input "=1+2" places the string "=1+2" in the cell, not a formula.
+    # (Non-string values like booleans or numbers are always handled as RAW.)
+    RAW = "RAW"
+    # The input is parsed exactly as if it were entered into the Google Sheets UI, so "Mar 1 2016" becomes a date, and "=1+2" becomes a formula.
+    # Formats may also be inferred, so "$100.15" becomes a number with currency formatting.
+    USER_ENTERED = "USER_ENTERED"
+
+  def __init__(self, name: str, cred_file=GOOGLE_CREDENTIALS_FILE):
+    self.sh: Spreadsheet
+    self.worksheet: Worksheet  # active worksheet
+
     # Google api's use this as the default credential if no other is provided.
     os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = cred_file
+    # Find existing or create a new spreadsheet.
+    key = self._find_spreadsheet(name)
+    if key == "":
+      key = self._create_spreadsheet(name)
 
-  def create_spreadsheet(self,
-                         name: str,
-                         parent=GOOGLE_DRIVE_PARENT_FOLDER_ID) -> SheetID:
+    client = service_account(filename=GOOGLE_CREDENTIALS_FILE)
+    self.sh = client.open_by_key(key)
+    self.worksheet = self.sh.sheet1  # default to sheet1
+
+  def _find_spreadsheet(self, name: str) -> SpreadsheetID:
+    '''
+    Finds a Google Spreadsheet by name, returning the SpreadsheetID. If no Spreadsheet of the
+    given name is found, returns an empty string.
+    '''
+    logging.info(f'Searching for a Spreadsheet named {name}')
+    service = build('drive', 'v3')
+    # q=f"'{REAL_ESTATE_FOLDER_ID}' in parents" searches only for files in the folder with id=REAL_ESTATE_FOLDER_ID.
+    res = service.files().list(
+        pageSize=1000, q=f"'{REAL_ESTATE_FOLDER_ID}' in parents").execute()
+    files = res.get('files', [])
+    if not files:
+      logging.warning(f'Spreadsheet named {name} was not found')
+      return ''
+    for file in files:
+      if file.get('name') == name:
+        id = file['id']
+        logging.info(f'Spreadsheet named {name} was found with id {id}')
+        return id
+    logging.warning(f'Spreadsheet named {name} was not found')
+    return ''
+
+  def _create_spreadsheet(self,
+                          name: str,
+                          parent=REAL_ESTATE_FOLDER_ID) -> SpreadsheetID:
     '''
     Creates a new Google Spreadsheet under an existing parent folder,
     returning the id of the newly created spreadsheet on success.
     '''
+    logging.info(f"Creating new Spreadsheet named {name}")
     service = build('drive', 'v3')
     res = service.files().create(
         body={
@@ -363,18 +434,133 @@ class GoogleSheetBuilder(object):
           f"Received unexpected Google Drive API response when attempting to create a new Spreadsheet: {res}"
       )
 
+    logging.info(f"Created new Spreadsheet named {name} with id {id}")
+
     return id
+
+  def get_or_create_worksheet(self, name: str):
+    '''
+    Gets a worksheet (if a worksheet by the given name exists) or creates a new one and sets the SpreadsheetBuilder to write to it.
+    '''
+    try:
+      self.worksheet = self.sh.worksheet(name)
+    except WorksheetNotFound:
+      self.worksheet = self.sh.add_worksheet(name, 1000, 26)
+
+  def update(self, range_name, values=None, **kwargs) -> Any:
+    '''
+    Updates the current worksheet
+    '''
+    return self.worksheet.update(range_name, values, **kwargs)
+
+
+@dataclass
+class ScenarioParams:
+  # Upfront expenses
+  prices: list[DollarAmount]
+  down_payment_rates: list[Percentage]
+  closing_cost_rates: list[Percentage]
+  immediate_repair_rates: list[Percentage]
+  furnishing_costs: list[DollarAmount]
+
+  # Ongoing expenses
+  yearly_mortgage_rates: list[Percentage]
+  monthly_utility_costs: list[DollarAmount]
+  yearly_capex_rates: list[Percentage]
+  yearly_maintenance_rates: list[Percentage]
+  monthly_management_rates: list[Percentage]
+  # taxes
+  # hoa
+
+  # Ongoing incomes
+  rent_estimates: list[RentEstimate]
 
 
 if __name__ == '__main__':
+  # page = requests.get(
+  #     "https://www.compass.com/listing/689-auburn-street-manchester-nh-03103/932977102909516985/"
+  # )
+  # listing = from_raw(page.text)
+  # sb = SpreadsheetBuilder(listing.pretty_address)
+  # re = RentEstimator()
+  # estimates = re.estimate(listing)
+  # for estimate in estimates:
+  #   pprint(estimate)
+
+  # s = SpreadsheetBuilder('test')
+  # sb.worksheet.update('A1', 7)
+  # s.worksheet.update('B1', "=A1 * 3", raw=False)
+  # s.worksheet.update_cell(2, 1, 7)
+  # s.worksheet.update_cell(2, 2, "=A2 * 3")
+
   page = requests.get(
       "https://www.compass.com/listing/689-auburn-street-manchester-nh-03103/932977102909516985/"
   )
-
   listing = from_raw(page.text)
-  re = RentEstimator()
-  estimates = re.estimate(listing)
-  for estimate in estimates:
-    print(estimate)
+  # re = RentEstimator()
+  # estimates = re.estimate(listing)
+  estimates = [
+      RentEstimate(units=[
+          RentEstimatedUnit(unit=Unit(beds=4, baths=1.0), monthly_rent=1657.0),
+          RentEstimatedUnit(unit=Unit(beds=3, baths=1.0), monthly_rent=1494.0)
+      ],
+                   type=EstimateType.AVERAGE),
+      RentEstimate(units=[
+          RentEstimatedUnit(unit=Unit(beds=4, baths=1.0), monthly_rent=1625.0),
+          RentEstimatedUnit(unit=Unit(beds=3, baths=1.0), monthly_rent=1500.0)
+      ],
+                   type=EstimateType.MEDIAN),
+      RentEstimate(units=[
+          RentEstimatedUnit(unit=Unit(beds=4, baths=1.0), monthly_rent=1601.0),
+          RentEstimatedUnit(unit=Unit(beds=3, baths=1.0), monthly_rent=1259.0)
+      ],
+                   type=EstimateType.PERCENTILE_25),
+      RentEstimate(units=[
+          RentEstimatedUnit(unit=Unit(beds=4, baths=1.0), monthly_rent=1713.0),
+          RentEstimatedUnit(unit=Unit(beds=3, baths=1.0), monthly_rent=1728.0)
+      ],
+                   type=EstimateType.PERCENTILE_75)
+  ]
+  params = ScenarioParams(
+      # Upfront expenses
+      prices=[listing.price],
+      down_payment_rates=[5],
+      closing_cost_rates=[3],
+      immediate_repair_rates=[3],
+      furnishing_costs=[10000],
+
+      # Ongoing expenses
+      yearly_mortgage_rates=[3.23],
+      monthly_utility_costs=[300],
+      yearly_capex_rates=[1.25],
+      yearly_maintenance_rates=[0.5],
+      monthly_management_rates=[10],
+      # taxes
+      # hoa
+
+      # Ongoing incomes
+      rent_estimates=estimates,
+  )
+  s = SpreadsheetBuilder(listing.pretty_address)
+  sheet_num = 0
+  for price in params.prices:
+    for down_payment_rate in params.down_payment_rates:
+      for closing_cost_rate in params.closing_cost_rates:
+        for immediate_repair_rate in params.immediate_repair_rates:
+          for furnishing_cost in params.furnishing_costs:
+            for yearly_mortgage_rate in params.yearly_mortgage_rates:
+              for monthly_utility_cost in params.monthly_utility_costs:
+                for yearly_capex_rate in params.yearly_mortgage_rates:
+                  for yearly_maintenance_rate in params.yearly_maintenance_rates:
+                    for monthly_management_rate in params.monthly_management_rates:
+                      for rent_estimate in params.rent_estimates:
+                        s.get_or_create_worksheet(str(sheet_num))
+                        s.update('A1', [["Price", listing.price]])
+
+                        sheet_num += 1
+
+  # sb = SpreadsheetBuilder(listing.pretty_address)
+  # for estimate in estimates:
+  #   pprint(estimate)
 
   exit(0)
