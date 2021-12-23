@@ -13,7 +13,7 @@ from typing import IO, Tuple, Any
 from gspread import service_account, Spreadsheet, Worksheet, WorksheetNotFound
 from pprint import pprint
 from constants import TOR_PATH, TOR_PORT, GECKO_DRIVER_PATH, GOOGLE_CREDENTIALS_FILE, REAL_ESTATE_FOLDER_ID
-from newtypes import Percentage, DollarAmount, Year, SpreadsheetID
+from types_ import Percentage, DollarAmount, Year, SpreadsheetID
 
 logging.basicConfig(level=logging.INFO,
                     format="%(levelname)s:%(funcName)s:%(message)s")
