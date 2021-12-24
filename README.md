@@ -1,6 +1,6 @@
 # Real Estate
 
-The python program uses `selenium` and requires that you download the appropriate [https://github.com/mozilla/geckodriver/releases](`Gecko driver binary`) and save it in a file named `geckodriver`.
+The python program uses `selenium` and requires that you download the appropriate [`Gecko driver binary`](https://github.com/mozilla/geckodriver/releases) and save it in a file named `geckodriver`.
 
 # LTR's
 
