@@ -1,4 +1,4 @@
-import json, logging, requests, subprocess, traceback, os, enum
+import json, logging, requests, subprocess, traceback, os, enum, time
 from selenium import webdriver
 from selenium.common.exceptions import NoSuchElementException
 from selenium.webdriver.firefox.options import Options
@@ -13,10 +13,10 @@ from typing import IO, Tuple, Any, Union
 from gspread import service_account, Spreadsheet, Worksheet, WorksheetNotFound
 from pprint import pprint
 from constants import TOR_PATH, TOR_PORT, GECKO_DRIVER_PATH, GOOGLE_CREDENTIALS_FILE, REAL_ESTATE_FOLDER_ID
-from types_ import Percentage, DollarAmount, Year, SpreadsheetID
+from types_ import Percentage, DollarAmount, SpreadsheetID
+from utils import calc_monthly_mortgage_payment, calc_down_payment
 
-logging.basicConfig(level=logging.INFO,
-                    format="%(levelname)s:%(funcName)s:%(message)s")
+logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(funcName)s:%(message)s")
 
 
 @dataclass
@@ -106,9 +106,8 @@ def from_raw(raw: str) -> Listing:
   '''
   logging.info("Extracting raw listing")
   return Listing(
-      json.loads(
-          raw.split("window.__PARTIAL_INITIAL_DATA__ = ")[1].split("</script>")
-          [0].strip())['props']['listingRelation']['listing'])
+      json.loads(raw.split("window.__PARTIAL_INITIAL_DATA__ = ")[1].split("</script>")[0].strip())
+      ['props']['listingRelation']['listing'])
 
 
 class EstimateType(enum.Enum):
@@ -148,8 +147,7 @@ class RentEstimator(object):
     self.estimates: list[RentEstimate]
 
   # TODO: could become a RentometerBrowser class
-  def _get_unthrottled_tor_browser(
-      self) -> Tuple[subprocess.Popen[bytes], webdriver.Firefox]:
+  def _get_unthrottled_tor_browser(self) -> Tuple[subprocess.Popen[bytes], webdriver.Firefox]:
     '''
     Sometimes if the TOR output node is known to Rentometer (or perhaps by some other mechanism),
     Rentometer will say that your free search limit is reached and the "Analyze" button will be inactive.
@@ -196,8 +194,7 @@ class RentEstimator(object):
       logging.info(f"https://www.rentometer.com/ connection succeeded")
       logging.info(f"Checking if the \"Analyze\" button is enabled")
       analyze_button = browser.find_element_by_name("commit")
-      analyze_button_disabled = analyze_button.get_attribute(
-          "disabled") == "true"
+      analyze_button_disabled = analyze_button.get_attribute("disabled") == "true"
 
       # If the analyze button is disabled, kill the browser and TOR and try again.
       if analyze_button_disabled:
@@ -207,8 +204,7 @@ class RentEstimator(object):
         browser.close()
         tor.kill()
       else:
-        logging.info(
-            "Got a Rentometer browser with the \"Analyze\" button enabled.")
+        logging.info("Got a Rentometer browser with the \"Analyze\" button enabled.")
 
     return (tor, browser)
 
@@ -243,19 +239,14 @@ class RentEstimator(object):
           self._nuke_tor_browser()
           self.tor, self.browser = self._get_unthrottled_tor_browser()
 
-        address_box = self.browser.find_element_by_id(
-            "address_unified_search_address")
-        beds_selector = Select(
-            self.browser.find_element_by_id(
-                "address_unified_search_bed_style"))
-        baths_selector = Select(
-            self.browser.find_element_by_id("address_unified_search_baths"))
+        address_box = self.browser.find_element_by_id("address_unified_search_address")
+        beds_selector = Select(self.browser.find_element_by_id("address_unified_search_bed_style"))
+        baths_selector = Select(self.browser.find_element_by_id("address_unified_search_baths"))
 
         address_box.send_keys(listing.pretty_address)
         logging.info(f"Entered {listing.pretty_address} into the address box")
 
-        beds_selector.select_by_value(str(
-            unit.beds))  # "1" = 1 bed, "2" = 2 beds, etc.
+        beds_selector.select_by_value(str(unit.beds))  # "1" = 1 bed, "2" = 2 beds, etc.
         logging.info(f"Selected {unit.beds} for \"Beds\"")
 
         # <option value="">Any</option>
@@ -289,8 +280,7 @@ class RentEstimator(object):
           logging.info("Analysis succeeded")
 
         # Now we're on the analysis page.
-        stats: list[WebElement] = self.browser.find_elements_by_class_name(
-            "box-stats")
+        stats: list[WebElement] = self.browser.find_elements_by_class_name("box-stats")
         average: DollarAmount = 0
         median: DollarAmount = 0
         twenty_fifth_percentile: DollarAmount = 0
@@ -303,36 +293,30 @@ class RentEstimator(object):
         for stat in stats:
           if 'AVERAGE' in stat.text:
             average = extract_dollar_value(stat)
-            estimate = next(
-                (e for e in self.estimates if e.type == EstimateType.AVERAGE),
-                RentEstimate([], EstimateType.AVERAGE))
+            estimate = next((e for e in self.estimates if e.type == EstimateType.AVERAGE),
+                            RentEstimate([], EstimateType.AVERAGE))
             estimate.units.append(RentEstimatedUnit(unit, average))
             if estimate not in self.estimates:
               self.estimates.append(estimate)
           elif 'MEDIAN' in stat.text:
             median = extract_dollar_value(stat)
-            estimate = next(
-                (e for e in self.estimates if e.type == EstimateType.MEDIAN),
-                RentEstimate([], EstimateType.MEDIAN))
+            estimate = next((e for e in self.estimates if e.type == EstimateType.MEDIAN),
+                            RentEstimate([], EstimateType.MEDIAN))
             estimate.units.append(RentEstimatedUnit(unit, median))
             if estimate not in self.estimates:
               self.estimates.append(estimate)
           elif '25TH PERCENTILE' in stat.text:
             twenty_fifth_percentile = extract_dollar_value(stat)
-            estimate = next((e for e in self.estimates
-                             if e.type == EstimateType.PERCENTILE_25),
+            estimate = next((e for e in self.estimates if e.type == EstimateType.PERCENTILE_25),
                             RentEstimate([], EstimateType.PERCENTILE_25))
-            estimate.units.append(
-                RentEstimatedUnit(unit, twenty_fifth_percentile))
+            estimate.units.append(RentEstimatedUnit(unit, twenty_fifth_percentile))
             if estimate not in self.estimates:
               self.estimates.append(estimate)
           elif '75TH PERCENTILE' in stat.text:
             seventy_fifth_percentile = extract_dollar_value(stat)
-            estimate = next((e for e in self.estimates
-                             if e.type == EstimateType.PERCENTILE_75),
+            estimate = next((e for e in self.estimates if e.type == EstimateType.PERCENTILE_75),
                             RentEstimate([], EstimateType.PERCENTILE_75))
-            estimate.units.append(
-                RentEstimatedUnit(unit, seventy_fifth_percentile))
+            estimate.units.append(RentEstimatedUnit(unit, seventy_fifth_percentile))
             if estimate not in self.estimates:
               self.estimates.append(estimate)
           else:
@@ -340,13 +324,11 @@ class RentEstimator(object):
 
         if average == 0 or median == 0 or twenty_fifth_percentile == 0 or seventy_fifth_percentile == 0:
           logging.error(
-              f"Could not extract at least one stat from stats box: {[s.text for s in stats]}"
-          )
+              f"Could not extract at least one stat from stats box: {[s.text for s in stats]}")
 
     except Exception:
       logging.error(
-          f"Unexpected error encountered while creating rent estimate: {traceback.format_exc()}"
-      )
+          f"Unexpected error encountered while creating rent estimate: {traceback.format_exc()}")
     finally:
       self._nuke_tor_browser()
 
@@ -396,6 +378,8 @@ class SpreadsheetBuilder(object):
     self.sh = client.open_by_key(key)
     self.worksheet = self.sh.sheet1  # default to sheet1
 
+    self.sheets_api_calls = 0
+
   def _find_spreadsheet(self, name: str) -> SpreadsheetID:
     '''
     Finds a Google Spreadsheet by name, returning the SpreadsheetID. If no Spreadsheet of the
@@ -404,8 +388,7 @@ class SpreadsheetBuilder(object):
     logging.info(f'Searching for a Spreadsheet named {name}')
     service = build('drive', 'v3')
     # q=f"'{REAL_ESTATE_FOLDER_ID}' in parents" searches only for files in the folder with id=REAL_ESTATE_FOLDER_ID.
-    res = service.files().list(
-        pageSize=1000, q=f"'{REAL_ESTATE_FOLDER_ID}' in parents").execute()
+    res = service.files().list(pageSize=1000, q=f"'{REAL_ESTATE_FOLDER_ID}' in parents").execute()
     files = res.get('files', [])
     if not files:
       logging.warning(f'Spreadsheet named {name} was not found')
@@ -418,21 +401,18 @@ class SpreadsheetBuilder(object):
     logging.warning(f'Spreadsheet named {name} was not found')
     return ''
 
-  def _create_spreadsheet(self,
-                          name: str,
-                          parent=REAL_ESTATE_FOLDER_ID) -> SpreadsheetID:
+  def _create_spreadsheet(self, name: str, parent=REAL_ESTATE_FOLDER_ID) -> SpreadsheetID:
     '''
     Creates a new Google Spreadsheet under an existing parent folder,
     returning the id of the newly created spreadsheet on success.
     '''
     logging.info(f"Creating new Spreadsheet named {name}")
     service = build('drive', 'v3')
-    res = service.files().create(
-        body={
-            'name': name,
-            'parents': [parent],
-            'mimeType': 'application/vnd.google-apps.spreadsheet'
-        }).execute()
+    res = service.files().create(body={
+        'name': name,
+        'parents': [parent],
+        'mimeType': 'application/vnd.google-apps.spreadsheet'
+    }).execute()
 
     id = res.get('id')
     if id is None:
@@ -449,17 +429,22 @@ class SpreadsheetBuilder(object):
     Gets a worksheet (if a worksheet by the given name exists) or creates a new one and sets the SpreadsheetBuilder to write to it.
     '''
     try:
+      self.sheets_api_calls += 1
       self.worksheet = self.sh.worksheet(name)
     except WorksheetNotFound:
+      self.sheets_api_calls += 1
       self.worksheet = self.sh.add_worksheet(name, 1000, 26)
     self.row = 1
 
-  def write_tuple(self, label: str, value: Union[str, Percentage,
-                                                 DollarAmount]):
+  def write_tuple(self, label: str, value: Union[str, Percentage, DollarAmount]):
     A = f"A{self.row}"
     B = f"B{self.row}"
+    self.sheets_api_calls += 1
     self.worksheet.update(A, [[label, str(value)]], raw=False)
     self._label_cache[label] = B
+    self.row += 1
+
+  def skip_line(self):
     self.row += 1
 
   def get_label_cell(self, label: str) -> str:
@@ -480,104 +465,104 @@ class ScenarioParams:
   monthly_utility_costs: list[DollarAmount]
   yearly_capex_rates: list[Percentage]
   yearly_maintenance_rates: list[Percentage]
-  monthly_management_rates: list[Percentage]
-  # taxes
-  # hoa
+  monthly_management_rate: Percentage
+  monthly_property_taxes: DollarAmount
+  monthly_hoa_fees: DollarAmount
 
   # Ongoing incomes
   rent_estimates: list[RentEstimate]
 
 
 if __name__ == '__main__':
-  # page = requests.get(
-  #     "https://www.compass.com/listing/689-auburn-street-manchester-nh-03103/932977102909516985/"
-  # )
-  # listing = from_raw(page.text)
-  # sb = SpreadsheetBuilder(listing.pretty_address)
-  # re = RentEstimator()
-  # estimates = re.estimate(listing)
-  # for estimate in estimates:
-  #   pprint(estimate)
+  startTime = time.time()
+  try:
+    # page = requests.get(
+    #     "https://www.compass.com/listing/689-auburn-street-manchester-nh-03103/932977102909516985/"
+    # )
+    # listing = from_raw(page.text)
+    # sb = SpreadsheetBuilder(listing.pretty_address)
+    # re = RentEstimator()
+    # estimates = re.estimate(listing)
+    # for estimate in estimates:
+    #   pprint(estimate)
 
-  # s = SpreadsheetBuilder('test')
-  # sb.worksheet.update('A1', 7)
-  # s.worksheet.update('B1', "=A1 * 3", raw=False)
-  # s.worksheet.update_cell(2, 1, 7)
-  # s.worksheet.update_cell(2, 2, "=A2 * 3")
+    # s = SpreadsheetBuilder('test')
+    # sb.worksheet.update('A1', 7)
+    # s.worksheet.update('B1', "=A1 * 3", raw=False)
+    # s.worksheet.update_cell(2, 1, 7)
+    # s.worksheet.update_cell(2, 2, "=A2 * 3")
 
-  page = requests.get(
-      "https://www.compass.com/listing/689-auburn-street-manchester-nh-03103/932977102909516985/"
-  )
-  listing = from_raw(page.text)
-  # re = RentEstimator()
-  # estimates = re.estimate(listing)
-  estimates = [
-      RentEstimate(units=[
-          RentEstimatedUnit(unit=Unit(beds=4, baths=1.0), monthly_rent=1657.0),
-          RentEstimatedUnit(unit=Unit(beds=3, baths=1.0), monthly_rent=1494.0)
-      ],
-                   type=EstimateType.AVERAGE),
-      RentEstimate(units=[
-          RentEstimatedUnit(unit=Unit(beds=4, baths=1.0), monthly_rent=1625.0),
-          RentEstimatedUnit(unit=Unit(beds=3, baths=1.0), monthly_rent=1500.0)
-      ],
-                   type=EstimateType.MEDIAN),
-      RentEstimate(units=[
-          RentEstimatedUnit(unit=Unit(beds=4, baths=1.0), monthly_rent=1601.0),
-          RentEstimatedUnit(unit=Unit(beds=3, baths=1.0), monthly_rent=1259.0)
-      ],
-                   type=EstimateType.PERCENTILE_25),
-      RentEstimate(units=[
-          RentEstimatedUnit(unit=Unit(beds=4, baths=1.0), monthly_rent=1713.0),
-          RentEstimatedUnit(unit=Unit(beds=3, baths=1.0), monthly_rent=1728.0)
-      ],
-                   type=EstimateType.PERCENTILE_75)
-  ]
-  params = ScenarioParams(
-      # Upfront expenses
-      prices=[listing.price],
-      down_payment_rates=[5],
-      closing_cost_rates=[3],
-      immediate_repair_rates=[3],
-      furnishing_costs=[10000],
+    page = requests.get(
+        "https://www.compass.com/listing/689-auburn-street-manchester-nh-03103/932977102909516985/")
+    listing = from_raw(page.text)
+    # re = RentEstimator()
+    # estimates = re.estimate(listing)
+    estimates = [
+        RentEstimate(units=[
+            RentEstimatedUnit(unit=Unit(beds=4, baths=1.0), monthly_rent=1657.0),
+            RentEstimatedUnit(unit=Unit(beds=3, baths=1.0), monthly_rent=1494.0)
+        ],
+                     type=EstimateType.AVERAGE),
+        RentEstimate(units=[
+            RentEstimatedUnit(unit=Unit(beds=4, baths=1.0), monthly_rent=1625.0),
+            RentEstimatedUnit(unit=Unit(beds=3, baths=1.0), monthly_rent=1500.0)
+        ],
+                     type=EstimateType.MEDIAN),
+        RentEstimate(units=[
+            RentEstimatedUnit(unit=Unit(beds=4, baths=1.0), monthly_rent=1601.0),
+            RentEstimatedUnit(unit=Unit(beds=3, baths=1.0), monthly_rent=1259.0)
+        ],
+                     type=EstimateType.PERCENTILE_25),
+        RentEstimate(units=[
+            RentEstimatedUnit(unit=Unit(beds=4, baths=1.0), monthly_rent=1713.0),
+            RentEstimatedUnit(unit=Unit(beds=3, baths=1.0), monthly_rent=1728.0)
+        ],
+                     type=EstimateType.PERCENTILE_75)
+    ]
+    params = ScenarioParams(
+        # Upfront expenses
+        prices=[listing.price],
+        down_payment_rates=[5],
+        closing_cost_rates=[3],
+        immediate_repair_rates=[3],
+        furnishing_costs=[10000],
 
-      # Ongoing expenses
-      yearly_mortgage_rates=[3.23],
-      monthly_utility_costs=[300],
-      yearly_capex_rates=[1.25],
-      yearly_maintenance_rates=[0.5],
-      monthly_management_rates=[10],
-      # taxes
-      # hoa
+        # Recurring income
+        rent_estimates=estimates,
 
-      # Ongoing incomes
-      rent_estimates=estimates,
-  )
-  s = SpreadsheetBuilder(listing.pretty_address)
-  sheet_num = 0
-  for price in params.prices:
-    for down_payment_rate in params.down_payment_rates:
-      for closing_cost_rate in params.closing_cost_rates:
-        for immediate_repair_rate in params.immediate_repair_rates:
-          for furnishing_cost in params.furnishing_costs:
-            for yearly_mortgage_rate in params.yearly_mortgage_rates:
-              for monthly_utility_cost in params.monthly_utility_costs:
-                for yearly_capex_rate in params.yearly_mortgage_rates:
-                  for yearly_maintenance_rate in params.yearly_maintenance_rates:
-                    for monthly_management_rate in params.monthly_management_rates:
+        # Recurring expenses
+        yearly_mortgage_rates=[3.23],
+        monthly_utility_costs=[300],
+        yearly_capex_rates=[1.25],
+        yearly_maintenance_rates=[0.5],
+        monthly_management_rate=10,
+        monthly_property_taxes=0,  # TODO
+        monthly_hoa_fees=0,  # TODO
+    )
+    s = SpreadsheetBuilder(listing.pretty_address)
+    sheet_num = 0
+    for price in params.prices:
+      for down_payment_rate in params.down_payment_rates:
+        for closing_cost_rate in params.closing_cost_rates:
+          for immediate_repair_rate in params.immediate_repair_rates:
+            for furnishing_cost in params.furnishing_costs:
+              for yearly_mortgage_rate in params.yearly_mortgage_rates:
+                for monthly_utility_cost in params.monthly_utility_costs:
+                  for yearly_capex_rate in params.yearly_capex_rates:
+                    for yearly_maintenance_rate in params.yearly_maintenance_rates:
                       for rent_estimate in params.rent_estimates:
-                        if sheet_num != 0:
-                          # TODO: dev/debug logic, remove
-                          continue
+                        # if sheet_num != 3:
+                        #   # TODO: dev/debug logic, remove
+                        #   sheet_num += 1
+                        #   continue
 
                         s.get_or_create_worksheet(str(sheet_num))
+                        # Upfront costs
                         s.write_tuple("Upfront Costs", "")
                         s.write_tuple("Price ($)", listing.price)
                         s.write_tuple("Down (%)", down_payment_rate)
-                        s.write_tuple("Closing cost rate (%)",
-                                      closing_cost_rate)
-                        s.write_tuple("Immediate repair rate (%)",
-                                      immediate_repair_rate)
+                        s.write_tuple("Closing cost rate (%)", closing_cost_rate)
+                        s.write_tuple("Immediate repair rate (%)", immediate_repair_rate)
                         s.write_tuple(
                             "Down Payment ($)",
                             f'={s.get_label_cell("Price ($)")}*({s.get_label_cell("Down (%)")}/100)'
@@ -590,17 +575,74 @@ if __name__ == '__main__':
                             "Immediate repairs ($)",
                             f'={s.get_label_cell("Price ($)")}*({s.get_label_cell("Immediate repair rate (%)")}/100)'
                         )
-                        s.write_tuple("Furnishing costs ($)",
-                                      str(furnishing_cost))
+                        s.write_tuple("Furnishing costs ($)", str(furnishing_cost))
                         s.write_tuple(
                             "TOTAL UPFRONT ($)",
                             f'={s.get_label_cell("Down Payment ($)")}+{s.get_label_cell("Closing costs ($)")}+{s.get_label_cell("Immediate repairs ($)")}+{s.get_label_cell("Furnishing costs ($)")}'
                         )
 
-                        sheet_num += 1
+                        # Rent estimates
+                        s.skip_line()
+                        s.write_tuple(f"Rents ({str(rent_estimate.type)})", "")
+                        gross_monthly_income_formula = "="
+                        for i in range(len(rent_estimate.units)):
+                          unit = rent_estimate.units[i].unit
+                          est = rent_estimate.units[i].monthly_rent
+                          label = f"Unit {i} ({unit.beds} beds, {unit.baths} baths)"
+                          s.write_tuple(label, est)
+                          gross_monthly_income_formula += s.get_label_cell(label)
+                          if i < len(rent_estimate.units) - 1:
+                            gross_monthly_income_formula += '+'
+                        s.write_tuple("GROSS MONTHLY INCOME (RENT)", gross_monthly_income_formula)
 
-  # sb = SpreadsheetBuilder(listing.pretty_address)
-  # for estimate in estimates:
-  #   pprint(estimate)
+                        # Monthly expenses
+                        s.skip_line()
+                        down_payment = calc_down_payment(price, down_payment_rate)
+                        s.write_tuple("Mortgage rate (%)", yearly_mortgage_rate)
+                        s.write_tuple(
+                            "Total loan amount ($)",
+                            f'={s.get_label_cell("Price ($)")} - {s.get_label_cell("Down Payment ($)")}'
+                        )
+                        s.write_tuple("Capex rate (%, yearly)", yearly_capex_rate)
+                        s.write_tuple("Maintenance rate (%, yearly)", yearly_maintenance_rate)
+                        s.write_tuple("Management rate (%, monthly)",
+                                      params.monthly_management_rate)
+                        s.write_tuple(
+                            "Mortgage payment ($, monthly)",
+                            calc_monthly_mortgage_payment(price=price,
+                                                          yearly_rate=yearly_mortgage_rate,
+                                                          down_payment=down_payment))
+                        s.write_tuple(
+                            "Average capex ($, monthly)",
+                            f'={s.get_label_cell("Price ($)")}*({s.get_label_cell("Capex rate (%, yearly)")} / 100) / 12'
+                        )
+                        s.write_tuple(
+                            "Average maintenance ($, monthly)",
+                            f'={s.get_label_cell("Price ($)")}*({s.get_label_cell("Maintenance rate (%, yearly)")} / 100) / 12'
+                        )
+                        s.write_tuple(
+                            "Management fee ($, monthly)",
+                            f'={s.get_label_cell("GROSS MONTHLY INCOME (RENT)")} * ({s.get_label_cell("Management rate (%, monthly)")} / 100)'
+                        )
+                        s.write_tuple("Utilities ($, monthly)", monthly_utility_cost)
+                        s.write_tuple("Property taxes ($, monthly)", params.monthly_property_taxes)
+                        s.write_tuple("HOA fees ($, monthly)", params.monthly_hoa_fees)
+                        s.write_tuple(
+                            "TOTAL MONTHLY EXPENSES",
+                            f'={s.get_label_cell("Mortgage payment ($, monthly)")} + {s.get_label_cell("Average capex ($, monthly)")} + {s.get_label_cell("Average maintenance ($, monthly)")} + {s.get_label_cell("Management fee ($, monthly)")} + {s.get_label_cell("Utilities ($, monthly)")} + {s.get_label_cell("Property taxes ($, monthly)")} + {s.get_label_cell("HOA fees ($, monthly)")}'
+                        )
+
+                        s.skip_line()
+                        s.write_tuple("Bottom Line", "")
+                        s.write_tuple(
+                            "NET MONTHLY INCOME",
+                            f'={s.get_label_cell("GROSS MONTHLY INCOME (RENT)")} - {s.get_label_cell("TOTAL MONTHLY EXPENSES")}'
+                        )
+
+                        sheet_num += 1
+  finally:
+    executionTime = (time.time() - startTime)
+    pprint(f"Total Sheets API calls: {s.sheets_api_calls}")
+    pprint('Execution time in seconds: ' + str(executionTime))
 
   exit(0)
