@@ -1,4 +1,7 @@
+import time, logging, json
+from typing import Callable
 from types_ import Percentage, DollarAmount, Year
+from gspread.exceptions import APIError
 
 
 def calc_monthly_mortgage_payment(price: DollarAmount,
@@ -26,3 +29,23 @@ def calc_monthly_mortgage_payment(price: DollarAmount,
 
 def calc_down_payment(price: DollarAmount, percent_down: Percentage) -> DollarAmount:
   return price * (percent_down / 100)
+
+
+def gspread_retry(func: Callable) -> Callable:
+  '''
+  Throttling approach of hitting the Google Sheets api until we get a 429, then waiting a minute before continuing.
+  '''
+  INTERVAL_SECS = 0
+
+  def wrapper(*args, **kwargs):
+    try:
+      func(*args, **kwargs)
+    except APIError as e:
+      if "'code': 429" in str(e):
+        logging.warning(f"Google Sheets API limit reached, pausing for {INTERVAL_SECS}")
+        time.sleep(INTERVAL_SECS)
+        wrapper(*args, **kwargs)
+      else:
+        raise e
+
+  return wrapper

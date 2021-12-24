@@ -1,4 +1,4 @@
-import json, logging, requests, subprocess, traceback, os, enum, time
+import json, logging, requests, subprocess, traceback, os, enum, time, pickle
 from selenium import webdriver
 from selenium.common.exceptions import NoSuchElementException
 from selenium.webdriver.firefox.options import Options
@@ -12,9 +12,9 @@ from locale import atof, setlocale, LC_NUMERIC
 from typing import IO, Tuple, Union
 from gspread import service_account, Spreadsheet, Worksheet, WorksheetNotFound
 from pprint import pprint
-from constants import TOR_PATH, TOR_PORT, GECKO_DRIVER_PATH, GOOGLE_CREDENTIALS_FILE, REAL_ESTATE_FOLDER_ID
+from constants import TOR_PATH, TOR_PORT, GECKO_DRIVER_PATH, GOOGLE_CREDENTIALS_FILE, REAL_ESTATE_FOLDER_ID, CACHEDIR, ESTIMATE_FILE
 from types_ import Percentage, DollarAmount, SpreadsheetID
-from utils import calc_monthly_mortgage_payment, calc_down_payment
+from utils import calc_monthly_mortgage_payment, calc_down_payment, gspread_retry
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(funcName)s:%(message)s")
 
@@ -225,6 +225,19 @@ class RentEstimator(object):
   def estimate(self, listing: Listing) -> list[RentEstimate]:
     logging.info(f"Estimating the rents at {listing.pretty_address}")
 
+    estimate_cache_dir = os.path.join(CACHEDIR, listing.pretty_address)
+    estimate_cache_file = os.path.join(estimate_cache_dir, ESTIMATE_FILE)
+    logging.info(f"Checking for cached estimates at {estimate_cache_file}")
+    try:
+      with open(estimate_cache_file, 'rb') as f:
+        self.estimates = pickle.load(f)
+        logging.info(
+            f"Found cached estimates for {listing.pretty_address}, using those for analysis")
+        return self.estimates
+    except FileNotFoundError:
+      logging.info(
+          f"Could not find cached estimates for {listing.pretty_address}, scraping rentometer")
+
     self.estimates = []
     self.tor, self.browser = self._get_unthrottled_tor_browser()
 
@@ -331,6 +344,13 @@ class RentEstimator(object):
           f"Unexpected error encountered while creating rent estimate: {traceback.format_exc()}")
     finally:
       self._nuke_tor_browser()
+
+    # Cache estimates
+    if not os.path.exists(estimate_cache_dir):
+      os.mkdir(estimate_cache_dir)
+    with open(estimate_cache_file, 'wb') as f:
+      logging.info(f"Caching estimates at {estimate_cache_file}")
+      pickle.dump(self.estimates, f)
 
     return self.estimates
 
@@ -450,19 +470,24 @@ class SpreadsheetBuilder(object):
 
     return id
 
-  def get_or_create_worksheet(self, name: str):
+  @gspread_retry
+  def _get_or_create_worksheet(self, name: str):
     '''
     Gets a worksheet (if a worksheet by the given name exists) or creates a new one and sets the SpreadsheetBuilder to write to it.
     '''
     try:
       self.sheets_api_calls += 1
+      logging.info(f"Trying to switch to worksheet {name}")
       self.worksheet = self.sh.worksheet(name)
     except WorksheetNotFound:
+      logging.info(f"Worksheet {name} not found, creating it instead")
       self.sheets_api_calls += 1
       self.worksheet = self.sh.add_worksheet(name, 1000, 26)
     self.row = 1
 
-  def write_tuple(self, label: str, value: Union[str, Percentage, DollarAmount]):
+  @gspread_retry
+  def _write_tuple(self, label: str, value: Union[str, Percentage, DollarAmount]):
+    logging.info(f"Writing tuple {label}, {value}")
     A = f"A{self.row}"
     B = f"B{self.row}"
     self.sheets_api_calls += 1
@@ -471,6 +496,7 @@ class SpreadsheetBuilder(object):
     self.row += 1
 
   def skip_line(self):
+    logging.info("Skipping line")
     self.row += 1
 
   def get_label_cell(self, label: str) -> str:
@@ -487,96 +513,96 @@ class SpreadsheetBuilder(object):
                   for yearly_capex_rate in self.params.yearly_capex_rates:
                     for yearly_maintenance_rate in self.params.yearly_maintenance_rates:
                       for rent_estimate in self.params.rent_estimates:
-                        self.get_or_create_worksheet(str(self.sheet_num))
+                        self._get_or_create_worksheet(str(self.sheet_num))
 
                         # Upfront costs
-                        self.write_tuple("Upfront Costs", "")
-                        self.write_tuple("Price ($)", price)
-                        self.write_tuple("Down (%)", down_payment_rate)
-                        self.write_tuple("Closing cost rate (%)", closing_cost_rate)
-                        self.write_tuple("Immediate repair rate (%)", immediate_repair_rate)
-                        self.write_tuple(
+                        self._write_tuple("Upfront Costs", "")
+                        self._write_tuple("Price ($)", price)
+                        self._write_tuple("Down (%)", down_payment_rate)
+                        self._write_tuple("Closing cost rate (%)", closing_cost_rate)
+                        self._write_tuple("Immediate repair rate (%)", immediate_repair_rate)
+                        self._write_tuple(
                             "Down Payment ($)",
                             f'={self.get_label_cell("Price ($)")}*({self.get_label_cell("Down (%)")}/100)'
                         )
-                        self.write_tuple(
+                        self._write_tuple(
                             "Closing costs ($)",
                             f'={self.get_label_cell("Price ($)")}*({self.get_label_cell("Closing cost rate (%)")}/100)'
                         )
-                        self.write_tuple(
+                        self._write_tuple(
                             "Immediate repairs ($)",
                             f'={self.get_label_cell("Price ($)")}*({self.get_label_cell("Immediate repair rate (%)")}/100)'
                         )
-                        self.write_tuple("Furnishing costs ($)", str(furnishing_cost))
-                        self.write_tuple(
+                        self._write_tuple("Furnishing costs ($)", str(furnishing_cost))
+                        self._write_tuple(
                             "TOTAL UPFRONT ($)",
                             f'={self.get_label_cell("Down Payment ($)")}+{self.get_label_cell("Closing costs ($)")}+{self.get_label_cell("Immediate repairs ($)")}+{self.get_label_cell("Furnishing costs ($)")}'
                         )
 
                         # Rent estimates
                         self.skip_line()
-                        self.write_tuple(f"Rents ({str(rent_estimate.type)})", "")
+                        self._write_tuple(f"Rents ({str(rent_estimate.type)})", "")
                         gross_monthly_income_formula = "="
                         for i in range(len(rent_estimate.units)):
                           unit = rent_estimate.units[i].unit
                           est = rent_estimate.units[i].monthly_rent
                           label = f"Unit {i} ({unit.beds} beds, {unit.baths} baths)"
-                          self.write_tuple(label, est)
+                          self._write_tuple(label, est)
                           gross_monthly_income_formula += self.get_label_cell(label)
                           if i < len(rent_estimate.units) - 1:
                             gross_monthly_income_formula += '+'
-                        self.write_tuple("GROSS MONTHLY INCOME (RENT)",
-                                         gross_monthly_income_formula)
+                        self._write_tuple("GROSS MONTHLY INCOME (RENT)",
+                                          gross_monthly_income_formula)
 
                         # Monthly expenses
                         self.skip_line()
                         down_payment = calc_down_payment(price, down_payment_rate)
-                        self.write_tuple("Mortgage rate (%)", yearly_mortgage_rate)
-                        self.write_tuple(
+                        self._write_tuple("Mortgage rate (%)", yearly_mortgage_rate)
+                        self._write_tuple(
                             "Total loan amount ($)",
                             f'={self.get_label_cell("Price ($)")} - {self.get_label_cell("Down Payment ($)")}'
                         )
-                        self.write_tuple("Capex rate (%, yearly)", yearly_capex_rate)
-                        self.write_tuple("Maintenance rate (%, yearly)", yearly_maintenance_rate)
-                        self.write_tuple("Management rate (%, monthly)",
-                                         self.params.monthly_management_rate)
-                        self.write_tuple(
+                        self._write_tuple("Capex rate (%, yearly)", yearly_capex_rate)
+                        self._write_tuple("Maintenance rate (%, yearly)", yearly_maintenance_rate)
+                        self._write_tuple("Management rate (%, monthly)",
+                                          self.params.monthly_management_rate)
+                        self._write_tuple(
                             "Mortgage payment ($, monthly)",
                             calc_monthly_mortgage_payment(price=price,
                                                           yearly_rate=yearly_mortgage_rate,
                                                           down_payment=down_payment))
-                        self.write_tuple(
+                        self._write_tuple(
                             "Average capex ($, monthly)",
                             f'={self.get_label_cell("Price ($)")}*({self.get_label_cell("Capex rate (%, yearly)")} / 100) / 12'
                         )
-                        self.write_tuple(
+                        self._write_tuple(
                             "Average maintenance ($, monthly)",
                             f'={self.get_label_cell("Price ($)")}*({self.get_label_cell("Maintenance rate (%, yearly)")} / 100) / 12'
                         )
-                        self.write_tuple(
+                        self._write_tuple(
                             "Management fee ($, monthly)",
                             f'={self.get_label_cell("GROSS MONTHLY INCOME (RENT)")} * ({self.get_label_cell("Management rate (%, monthly)")} / 100)'
                         )
-                        self.write_tuple("Utilities ($, monthly)", monthly_utility_cost)
-                        self.write_tuple("Property taxes ($, monthly)",
-                                         self.params.monthly_property_taxes)
-                        self.write_tuple("HOA fees ($, monthly)", self.params.monthly_hoa_fees)
-                        self.write_tuple(
+                        self._write_tuple("Utilities ($, monthly)", monthly_utility_cost)
+                        self._write_tuple("Property taxes ($, monthly)",
+                                          self.params.monthly_property_taxes)
+                        self._write_tuple("HOA fees ($, monthly)", self.params.monthly_hoa_fees)
+                        self._write_tuple(
                             "Mortgageless Monthly Expenses",
                             f'={self.get_label_cell("Average capex ($, monthly)")} + {self.get_label_cell("Average maintenance ($, monthly)")} + {self.get_label_cell("Management fee ($, monthly)")} + {self.get_label_cell("Utilities ($, monthly)")} + {self.get_label_cell("Property taxes ($, monthly)")} + {self.get_label_cell("HOA fees ($, monthly)")}'
                         )
-                        self.write_tuple(
+                        self._write_tuple(
                             "Mortgageless Expenses / Rents (\"50% rule\"?)",
                             f'={self.get_label_cell("Mortgageless Monthly Expenses")} / {self.get_label_cell("GROSS MONTHLY INCOME (RENT)")}'
                         )
-                        self.write_tuple(
+                        self._write_tuple(
                             "TOTAL MONTHLY EXPENSES",
                             f'={self.get_label_cell("Mortgage payment ($, monthly)")} + {self.get_label_cell("Mortgageless Monthly Expenses")}'
                         )
 
                         self.skip_line()
-                        self.write_tuple("Bottom Line", "")
-                        self.write_tuple(
+                        self._write_tuple("Bottom Line", "")
+                        self._write_tuple(
                             "NET MONTHLY INCOME",
                             f'={self.get_label_cell("GROSS MONTHLY INCOME (RENT)")} - {self.get_label_cell("TOTAL MONTHLY EXPENSES")}'
                         )
@@ -586,34 +612,13 @@ class SpreadsheetBuilder(object):
 
 if __name__ == '__main__':
   startTime = time.time()
+  s: SpreadsheetBuilder
   try:
     page = requests.get(
         "https://www.compass.com/listing/689-auburn-street-manchester-nh-03103/932977102909516985/")
     listing = from_raw(page.text)
-    # re = RentEstimator()
-    # estimates = re.estimate(listing)
-    estimates = [
-        RentEstimate(units=[
-            RentEstimatedUnit(unit=Unit(beds=4, baths=1.0), monthly_rent=1657.0),
-            RentEstimatedUnit(unit=Unit(beds=3, baths=1.0), monthly_rent=1494.0)
-        ],
-                     type=EstimateType.AVERAGE),
-        RentEstimate(units=[
-            RentEstimatedUnit(unit=Unit(beds=4, baths=1.0), monthly_rent=1625.0),
-            RentEstimatedUnit(unit=Unit(beds=3, baths=1.0), monthly_rent=1500.0)
-        ],
-                     type=EstimateType.MEDIAN),
-        RentEstimate(units=[
-            RentEstimatedUnit(unit=Unit(beds=4, baths=1.0), monthly_rent=1601.0),
-            RentEstimatedUnit(unit=Unit(beds=3, baths=1.0), monthly_rent=1259.0)
-        ],
-                     type=EstimateType.PERCENTILE_25),
-        RentEstimate(units=[
-            RentEstimatedUnit(unit=Unit(beds=4, baths=1.0), monthly_rent=1713.0),
-            RentEstimatedUnit(unit=Unit(beds=3, baths=1.0), monthly_rent=1728.0)
-        ],
-                     type=EstimateType.PERCENTILE_75)
-    ]
+    re = RentEstimator()
+    estimates = re.estimate(listing)
     s = SpreadsheetBuilder(
         listing.pretty_address,
         ScenarioParams(
@@ -625,7 +630,8 @@ if __name__ == '__main__':
             furnishing_costs=[10000],
 
             # Recurring income
-            rent_estimates=[e for e in estimates if e.type == EstimateType.AVERAGE],
+            # rent_estimates=[e for e in estimates if e.type == EstimateType.AVERAGE],
+            rent_estimates=estimates,
 
             # Recurring expenses
             yearly_mortgage_rates=[3.23],
