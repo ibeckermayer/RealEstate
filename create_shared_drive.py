@@ -18,21 +18,14 @@ def main():
   os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = SERVICE_ACCOUNT_CREDENTIALS
   service = build('drive', 'v3')
 
-  folder_metadata = {
-      'name': 'Real Estate',
-      'mimeType': 'application/vnd.google-apps.folder'
-  }
+  folder_metadata = {'name': 'Real Estate', 'mimeType': 'application/vnd.google-apps.folder'}
   folder = service.files().create(body=folder_metadata, fields='id').execute()
   folder_id = folder.get("id")
   print(f'REAL_ESTATE_FOLDER_ID = "{folder.get("id")}"')
 
-  permission_metadata = {
-      'role': 'writer',
-      'type': 'user',
-      'emailAddress': HUMAN_ACCOUNT_EMAIL
-  }
-  permission = service.permissions().create(
-      fileId=folder_id, fields='*', body=permission_metadata).execute()
+  permission_metadata = {'role': 'writer', 'type': 'user', 'emailAddress': HUMAN_ACCOUNT_EMAIL}
+  permission = service.permissions().create(fileId=folder_id, fields='*',
+                                            body=permission_metadata).execute()
   print(permission)
 
 
