@@ -9,7 +9,7 @@ from selenium.webdriver.common.desired_capabilities import DesiredCapabilities
 from googleapiclient.discovery import build
 from dataclasses import dataclass
 from locale import atof, setlocale, LC_NUMERIC
-from typing import IO, Tuple, Any
+from typing import IO, Tuple, Any, Union
 from gspread import service_account, Spreadsheet, Worksheet, WorksheetNotFound
 from pprint import pprint
 from constants import TOR_PATH, TOR_PORT, GECKO_DRIVER_PATH, GOOGLE_CREDENTIALS_FILE, REAL_ESTATE_FOLDER_ID
@@ -362,22 +362,28 @@ class SpreadsheetBuilder(object):
   - 300 / minute
   - ∞ / day
   '''
-  class ValueInputOption(enum.Enum):
-    '''
-    Updates require a valid ValueInputOption parameter (for singular updates, this is a required query
-    parameter; for batch updates, this parameter is required in the request body)
-    '''
-
-    # The input is not parsed and is simply inserted as a string, so the input "=1+2" places the string "=1+2" in the cell, not a formula.
-    # (Non-string values like booleans or numbers are always handled as RAW.)
-    RAW = "RAW"
-    # The input is parsed exactly as if it were entered into the Google Sheets UI, so "Mar 1 2016" becomes a date, and "=1+2" becomes a formula.
-    # Formats may also be inferred, so "$100.15" becomes a number with currency formatting.
-    USER_ENTERED = "USER_ENTERED"
-
   def __init__(self, name: str, cred_file=GOOGLE_CREDENTIALS_FILE):
     self.sh: Spreadsheet
     self.worksheet: Worksheet  # active worksheet
+    self.row = 1  # row to write to
+
+    # _label_cache is used to keep track of which cells contain which values, indexed by their label.
+    # For example, if self.next_row = 3, calling self.write_tuple("furniture", 700) will add an entry
+    # in the next row of the Spreadsheet that looks like:
+    #
+    #      A3        B3
+    # ---------------------
+    # |furniture |   700  |
+    # ---------------------
+    #
+    # And the tuple cache will get a new entry:
+    # {
+    #   'furniture': 'B3'
+    # }
+    #
+    # Then later you can find the cell again using the _label_cache like:
+    # self.write_tuple("double furniture", f"=2 * {self._label_cache["furniture"]}")
+    self._label_cache: dict[str, str] = {}
 
     # Google api's use this as the default credential if no other is provided.
     os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = cred_file
@@ -446,12 +452,18 @@ class SpreadsheetBuilder(object):
       self.worksheet = self.sh.worksheet(name)
     except WorksheetNotFound:
       self.worksheet = self.sh.add_worksheet(name, 1000, 26)
+    self.row = 1
 
-  def update(self, range_name, values=None, **kwargs) -> Any:
-    '''
-    Updates the current worksheet
-    '''
-    return self.worksheet.update(range_name, values, **kwargs)
+  def write_tuple(self, label: str, value: Union[str, Percentage,
+                                                 DollarAmount]):
+    A = f"A{self.row}"
+    B = f"B{self.row}"
+    self.worksheet.update(A, [[label, str(value)]], raw=False)
+    self._label_cache[label] = B
+    self.row += 1
+
+  def get_label_cell(self, label: str) -> str:
+    return self._label_cache[label]
 
 
 @dataclass
@@ -554,8 +566,36 @@ if __name__ == '__main__':
                   for yearly_maintenance_rate in params.yearly_maintenance_rates:
                     for monthly_management_rate in params.monthly_management_rates:
                       for rent_estimate in params.rent_estimates:
+                        if sheet_num != 0:
+                          # TODO: dev/debug logic, remove
+                          continue
+
                         s.get_or_create_worksheet(str(sheet_num))
-                        s.update('A1', [["Price", listing.price]])
+                        s.write_tuple("Upfront Costs", "")
+                        s.write_tuple("Price ($)", listing.price)
+                        s.write_tuple("Down (%)", down_payment_rate)
+                        s.write_tuple("Closing cost rate (%)",
+                                      closing_cost_rate)
+                        s.write_tuple("Immediate repair rate (%)",
+                                      immediate_repair_rate)
+                        s.write_tuple(
+                            "Down Payment ($)",
+                            f'={s.get_label_cell("Price ($)")}*({s.get_label_cell("Down (%)")}/100)'
+                        )
+                        s.write_tuple(
+                            "Closing costs ($)",
+                            f'={s.get_label_cell("Price ($)")}*({s.get_label_cell("Closing cost rate (%)")}/100)'
+                        )
+                        s.write_tuple(
+                            "Immediate repairs ($)",
+                            f'={s.get_label_cell("Price ($)")}*({s.get_label_cell("Immediate repair rate (%)")}/100)'
+                        )
+                        s.write_tuple("Furnishing costs ($)",
+                                      str(furnishing_cost))
+                        s.write_tuple(
+                            "TOTAL UPFRONT ($)",
+                            f'={s.get_label_cell("Down Payment ($)")}+{s.get_label_cell("Closing costs ($)")}+{s.get_label_cell("Immediate repairs ($)")}+{s.get_label_cell("Furnishing costs ($)")}'
+                        )
 
                         sheet_num += 1
 
