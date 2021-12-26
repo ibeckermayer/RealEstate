@@ -1,7 +1,8 @@
-import time, logging, json
-from typing import Callable
+import time, logging, os, sys
+from typing import Callable, cast
 from types_ import Percentage, DollarAmount, Year
 from gspread.exceptions import APIError
+from constants import LOGSDIR, LOGFILE, LOGFMT
 
 
 def calc_monthly_mortgage_payment(price: DollarAmount,
@@ -49,3 +50,30 @@ def gspread_retry(func: Callable) -> Callable:
         raise e
 
   return wrapper
+
+
+def get_logger(pretty_address: str) -> logging.Logger:
+  '''
+  Gets a logger by the given name (pretty_address) or creates it if it doesn't exist.'
+  '''
+  _existing_log = logging.Logger.manager.loggerDict.get(pretty_address)
+  if _existing_log is not None and type(_existing_log) is not logging.PlaceHolder:
+    existing_log = cast(logging.Logger, _existing_log)
+    return existing_log
+
+  logdir = os.path.join(LOGSDIR, pretty_address)
+  if not os.path.exists(logdir):
+    os.makedirs(logdir)
+  logfile = os.path.join(logdir, LOGFILE)
+
+  formatter = logging.Formatter(LOGFMT)
+  stderrHandler = logging.StreamHandler(sys.stderr)
+  stderrHandler.setFormatter(formatter)
+  fileHandler = logging.FileHandler(logfile)
+  fileHandler.setFormatter(formatter)
+  logger = logging.getLogger(pretty_address)
+  logger.addHandler(stderrHandler)
+  logger.addHandler(fileHandler)
+  logger.setLevel(logging.DEBUG)  # TODO: make configurable
+
+  return logger

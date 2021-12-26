@@ -7,3 +7,7 @@ REAL_ESTATE_FOLDER_ID = '1Qiv2MVdYjE7KaYUVnWVvnOMAFp4rNPbX'
 
 CACHEDIR = "cache"
 ESTIMATE_FILE = "rent_estimates.pickle"
+
+LOGSDIR = "logs"
+LOGFILE = "logs.log"
+LOGFMT = "%(asctime)s:%(levelname)s:%(funcName)s:%(message)s"

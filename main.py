@@ -1,4 +1,4 @@
-import json, logging, requests, subprocess, traceback, os, enum, time, pickle
+import json, logging, requests, subprocess, traceback, os, enum, time, pickle, inspect
 from selenium import webdriver
 from selenium.common.exceptions import NoSuchElementException
 from selenium.webdriver.firefox.options import Options
@@ -14,9 +14,10 @@ from gspread import service_account, Spreadsheet, Worksheet, WorksheetNotFound
 from pprint import pprint
 from constants import TOR_PATH, TOR_PORT, GECKO_DRIVER_PATH, GOOGLE_CREDENTIALS_FILE, REAL_ESTATE_FOLDER_ID, CACHEDIR, ESTIMATE_FILE
 from types_ import Percentage, DollarAmount, SpreadsheetID
-from utils import calc_monthly_mortgage_payment, calc_down_payment, gspread_retry
+from utils import calc_monthly_mortgage_payment, calc_down_payment, gspread_retry, get_logger
+from functools import cached_property
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(funcName)s:%(message)s")
+inspect.ismethod
 
 
 @dataclass
@@ -31,6 +32,12 @@ class Listing:
   '''
   def __init__(self, raw_listing: dict):
     self.raw_listing = raw_listing
+    self.logger = get_logger(self.pretty_address)
+
+    # The following line causes all @property's and @cached_property's to
+    # evaluate immediately, which will cause any uknown data structures
+    # in the raw_listing to throw an error immediately.
+    inspect.getmembers(self)
 
   @property
   def price(self) -> DollarAmount:
@@ -49,7 +56,7 @@ class Listing:
     zip_code = location['zipCode']
     return street_addr + ', ' + city + ', ' + state + ' ' + zip_code
 
-  @property
+  @cached_property
   def units(self) -> list[Unit]:
     '''
     [{'name': 'Unit 1',
@@ -67,14 +74,28 @@ class Listing:
 
     TODO: multi family info may be laid out differently i.e.: https://www.compass.com/listing/1050-palafox-drive-northeast-atlanta-ga-30324/845726107540165857/
     '''
-    logging.debug(f"Attempting to extract unit information")
+    self.logger.info(f"Attempting to extract unit information from the raw_listing")
     raw_units = []
 
+    try:
+      self.logger.info(f"Checking for raw_listing['detailedInfo']['listingDetails']")
+      self.logger.info(f"{self.raw_listing['detailedInfo']['listingDetails']}")
+    except KeyError:
+      try:
+        self.logger.warning(
+            f"raw_listing['detailedInfo']['listingDetails'] failed, seeing if raw_listing['detailedInfo'] works"
+        )
+        self.logger.info(f"{self.raw_listing['detailedInfo']}")
+      except KeyError:
+        self.logger.warning(f"raw_listing['detailedInfo'] failed, here's the whole raw_listing")
+        self.logger.info(f"{self.raw_listing}")
+      raise Exception("Failed to extract unit info from the raw listing")
+
     for detail in self.raw_listing['detailedInfo']['listingDetails']:
-      logging.debug(f"Examining detail: {detail}")
+      self.logger.info(f"Examining detail: {detail}")
       if detail.get('name') == 'Unit Information':
         raw_units = detail['subCategories']
-        logging.debug(
+        self.logger.info(
             f"Found the 'Unit Information' detail, attempting to extract units from raw_units: {raw_units}"
         )
 
@@ -86,13 +107,13 @@ class Listing:
         if 'Baths' in field['key']:
           pass
           if 'Half' in field['key']:
-            logging.debug(f"Interpreting {field['key']} as half bath")
+            self.logger.debug(f"Interpreting {field['key']} as half bath")
             baths += 0.5 * float(field['values'][0])
           else:
-            logging.debug(f"Interpreting {field['key']} as full bath")
+            self.logger.debug(f"Interpreting {field['key']} as full bath")
             baths += int(field['values'][0])
         elif 'Bedrooms' in field['key']:
-          logging.debug(f"Interpreting {field['key']} as bedroom")
+          self.logger.debug(f"Interpreting {field['key']} as bedroom")
           beds = int(field['values'][0])
       units.append(Unit(beds, baths))
 
@@ -139,8 +160,10 @@ class RentEstimator(object):
   '''
   def __init__(
       self,
+      logger: logging.Logger,
       geckodriver: str = GECKO_DRIVER_PATH,
   ):
+    self.logger = logger
     self.browser: webdriver.Firefox
     self.tor: subprocess.Popen[bytes]
     self.geckodriver = geckodriver
@@ -167,7 +190,7 @@ class RentEstimator(object):
 
     analyze_button_disabled = True
     while analyze_button_disabled:
-      logging.info("Starting TOR...")
+      self.logger.info("Starting TOR...")
       # Start TOR and wait for it to boot up.
       # TODO: add a timeout here.
       tor = subprocess.Popen(TOR_PATH, stdout=subprocess.PIPE)
@@ -177,40 +200,40 @@ class RentEstimator(object):
       stdout: IO[bytes] = maybe_stdout
       while True:
         line = stdout.readline()
-        logging.debug(f"TOR startup output: {'{!r}'.format(line)}")
+        self.logger.debug(f"TOR startup output: {'{!r}'.format(line)}")
         if b"100% (done): Done" in line:
           break
-      logging.info(f"TOR started successfully")
+      self.logger.info(f"TOR started successfully")
 
       # Create a TOR browser
-      logging.info(f"Opening browser...")
+      self.logger.info(f"Opening browser...")
       browser = webdriver.Firefox(service=Service(self.geckodriver),
                                   options=options,
                                   capabilities=capabilities)
 
       # Connect to Rentometer and check if the analyze_button is disabled.
-      logging.info(f"Connecting to https://www.rentometer.com/")
+      self.logger.info(f"Connecting to https://www.rentometer.com/")
       browser.get("https://www.rentometer.com/")
-      logging.info(f"https://www.rentometer.com/ connection succeeded")
-      logging.info(f"Checking if the \"Analyze\" button is enabled")
+      self.logger.info(f"https://www.rentometer.com/ connection succeeded")
+      self.logger.info(f"Checking if the \"Analyze\" button is enabled")
       analyze_button = browser.find_element_by_name("commit")
       analyze_button_disabled = analyze_button.get_attribute("disabled") == "true"
 
       # If the analyze button is disabled, kill the browser and TOR and try again.
       if analyze_button_disabled:
-        logging.warning(
+        self.logger.warning(
             "Opened Rentometer \"Analyze\" button was disabled. Killing the browser and TOR and trying again."
         )
         browser.close()
         tor.kill()
       else:
-        logging.info("Got a Rentometer browser with the \"Analyze\" button enabled.")
+        self.logger.info("Got a Rentometer browser with the \"Analyze\" button enabled.")
 
     return (tor, browser)
 
   def _nuke_tor_browser(self):
     # Close the browser and kill TOR.
-    logging.info("Closing the browser and killing TOR")
+    self.logger.info("Closing the browser and killing TOR")
     try:
       self.browser.close()
     except AttributeError:
@@ -223,19 +246,19 @@ class RentEstimator(object):
       pass
 
   def estimate(self, listing: Listing) -> list[RentEstimate]:
-    logging.info(f"Estimating the rents at {listing.pretty_address}")
+    self.logger.info(f"Estimating the rents at {listing.pretty_address}")
 
     estimate_cache_dir = os.path.join(CACHEDIR, listing.pretty_address)
     estimate_cache_file = os.path.join(estimate_cache_dir, ESTIMATE_FILE)
-    logging.info(f"Checking for cached estimates at {estimate_cache_file}")
+    self.logger.info(f"Checking for cached estimates at {estimate_cache_file}")
     try:
       with open(estimate_cache_file, 'rb') as f:
         self.estimates = pickle.load(f)
-        logging.info(
+        self.logger.info(
             f"Found cached estimates for {listing.pretty_address}, using those for analysis")
         return self.estimates
     except FileNotFoundError:
-      logging.info(
+      self.logger.info(
           f"Could not find cached estimates for {listing.pretty_address}, scraping rentometer")
 
     self.estimates = []
@@ -243,7 +266,7 @@ class RentEstimator(object):
 
     try:
       for unit in listing.units:
-        logging.info(f"Estimating rent for unit: {unit}")
+        self.logger.info(f"Estimating rent for unit: {unit}")
 
         # Find the relevant UI elements
         analyze_button = self.browser.find_element_by_name("commit")
@@ -257,32 +280,32 @@ class RentEstimator(object):
         baths_selector = Select(self.browser.find_element_by_id("address_unified_search_baths"))
 
         address_box.send_keys(listing.pretty_address)
-        logging.info(f"Entered {listing.pretty_address} into the address box")
+        self.logger.info(f"Entered {listing.pretty_address} into the address box")
 
         beds_selector.select_by_value(str(unit.beds))  # "1" = 1 bed, "2" = 2 beds, etc.
-        logging.info(f"Selected {unit.beds} for \"Beds\"")
+        self.logger.info(f"Selected {unit.beds} for \"Beds\"")
 
         # <option value="">Any</option>
         # <option value="1">1 Only</option>
         # <option value="1.5">1½ or more</option>
         if unit.baths == 1:
           baths_selector.select_by_value("1")
-          logging.info(f"Selected \"1 Only\" for \"Baths\"")
+          self.logger.info(f"Selected \"1 Only\" for \"Baths\"")
         elif unit.baths > 1:
           baths_selector.select_by_value("1.5")
-          logging.info(f"Selected \"1½ or more\" for \"Baths\"")
+          self.logger.info(f"Selected \"1½ or more\" for \"Baths\"")
         else:
           raise ValueError(f"Unexpected number of baths: {unit.baths}")
 
         # Click analyze button to get analysis (typically opens a new page).
-        logging.info("Clicking the analyze button")
+        self.logger.info("Clicking the analyze button")
         analyze_button.click()
 
         # Check that rentometer was able to find enough results.
         try:
           if "Sorry, there are not enough results in that location to generate a valid analysis." in self.browser.find_element_by_xpath(
               "/html/body/div[3]/div").text:
-            logging.error(
+            self.logger.error(
                 "\"Sorry, there are not enough results in that location to generate a valid analysis.\""
             )
             # TODO all the above logic should be wrapped in a try logic, if the exception that will be thrown here is caught then
@@ -290,7 +313,7 @@ class RentEstimator(object):
             continue
         except NoSuchElementException:
           # This is the happy path.
-          logging.info("Analysis succeeded")
+          self.logger.info("Analysis succeeded")
 
         # Now we're on the analysis page.
         stats: list[WebElement] = self.browser.find_elements_by_class_name("box-stats")
@@ -333,14 +356,14 @@ class RentEstimator(object):
             if estimate not in self.estimates:
               self.estimates.append(estimate)
           else:
-            logging.warning(f"Unexpected stat in stats box: {stat.text}")
+            self.logger.warning(f"Unexpected stat in stats box: {stat.text}")
 
         if average == 0 or median == 0 or twenty_fifth_percentile == 0 or seventy_fifth_percentile == 0:
-          logging.error(
+          self.logger.error(
               f"Could not extract at least one stat from stats box: {[s.text for s in stats]}")
 
     except Exception:
-      logging.error(
+      self.logger.error(
           f"Unexpected error encountered while creating rent estimate: {traceback.format_exc()}")
     finally:
       self._nuke_tor_browser()
@@ -349,7 +372,7 @@ class RentEstimator(object):
     if not os.path.exists(estimate_cache_dir):
       os.mkdir(estimate_cache_dir)
     with open(estimate_cache_file, 'wb') as f:
-      logging.info(f"Caching estimates at {estimate_cache_file}")
+      self.logger.info(f"Caching estimates at {estimate_cache_file}")
       pickle.dump(self.estimates, f)
 
     return self.estimates
@@ -386,7 +409,11 @@ class SpreadsheetBuilder(object):
   - 300 / minute
   - ∞ / day
   '''
-  def __init__(self, name: str, params: ScenarioParams, cred_file=GOOGLE_CREDENTIALS_FILE):
+  def __init__(self,
+               name: str,
+               params: ScenarioParams,
+               logger: logging.Logger,
+               cred_file=GOOGLE_CREDENTIALS_FILE):
     self.sh: Spreadsheet
     self.worksheet: Worksheet  # active worksheet
 
@@ -394,6 +421,8 @@ class SpreadsheetBuilder(object):
     self.params = params
     self.row = 1  # row to write to
     self.sheet_num = 0  # uid for each worksheet
+
+    self.logger = logger
 
     # _label_cache is used to keep track of which cells contain which values, indexed by their label.
     # For example, if self.next_row = 3, calling self.write_tuple("furniture", 700) will add an entry
@@ -424,27 +453,25 @@ class SpreadsheetBuilder(object):
     self.sh = client.open_by_key(key)
     self.worksheet = self.sh.sheet1  # default to sheet1
 
-    self.sheets_api_calls = 0
-
   def _find_spreadsheet(self, name: str) -> SpreadsheetID:
     '''
     Finds a Google Spreadsheet by name, returning the SpreadsheetID. If no Spreadsheet of the
     given name is found, returns an empty string.
     '''
-    logging.info(f'Searching for a Spreadsheet named {name}')
+    self.logger.info(f'Searching for a Spreadsheet named {name}')
     service = build('drive', 'v3')
     # q=f"'{REAL_ESTATE_FOLDER_ID}' in parents" searches only for files in the folder with id=REAL_ESTATE_FOLDER_ID.
     res = service.files().list(pageSize=1000, q=f"'{REAL_ESTATE_FOLDER_ID}' in parents").execute()
     files = res.get('files', [])
     if not files:
-      logging.warning(f'Spreadsheet named {name} was not found')
+      self.logger.warning(f'Spreadsheet named {name} was not found')
       return ''
     for file in files:
       if file.get('name') == name:
         id = file['id']
-        logging.info(f'Spreadsheet named {name} was found with id {id}')
+        self.logger.info(f'Spreadsheet named {name} was found with id {id}')
         return id
-    logging.warning(f'Spreadsheet named {name} was not found')
+    self.logger.warning(f'Spreadsheet named {name} was not found')
     return ''
 
   def _create_spreadsheet(self, name: str, parent=REAL_ESTATE_FOLDER_ID) -> SpreadsheetID:
@@ -452,7 +479,7 @@ class SpreadsheetBuilder(object):
     Creates a new Google Spreadsheet under an existing parent folder,
     returning the id of the newly created spreadsheet on success.
     '''
-    logging.info(f"Creating new Spreadsheet named {name}")
+    self.logger.info(f"Creating new Spreadsheet named {name}")
     service = build('drive', 'v3')
     res = service.files().create(body={
         'name': name,
@@ -466,7 +493,7 @@ class SpreadsheetBuilder(object):
           f"Received unexpected Google Drive API response when attempting to create a new Spreadsheet: {res}"
       )
 
-    logging.info(f"Created new Spreadsheet named {name} with id {id}")
+    self.logger.info(f"Created new Spreadsheet named {name} with id {id}")
 
     return id
 
@@ -476,27 +503,24 @@ class SpreadsheetBuilder(object):
     Gets a worksheet (if a worksheet by the given name exists) or creates a new one and sets the SpreadsheetBuilder to write to it.
     '''
     try:
-      self.sheets_api_calls += 1
-      logging.info(f"Trying to switch to worksheet {name}")
+      self.logger.info(f"Trying to switch to worksheet {name}")
       self.worksheet = self.sh.worksheet(name)
     except WorksheetNotFound:
-      logging.info(f"Worksheet {name} not found, creating it instead")
-      self.sheets_api_calls += 1
+      self.logger.info(f"Worksheet {name} not found, creating it instead")
       self.worksheet = self.sh.add_worksheet(name, 1000, 26)
     self.row = 1
 
   @gspread_retry
   def _write_tuple(self, label: str, value: Union[str, Percentage, DollarAmount]):
-    logging.info(f"Writing tuple {label}, {value}")
+    self.logger.info(f"Writing tuple {label}, {value}")
     A = f"A{self.row}"
     B = f"B{self.row}"
-    self.sheets_api_calls += 1
     self.worksheet.update(A, [[label, str(value)]], raw=False)
     self._label_cache[label] = B
     self.row += 1
 
   def skip_line(self):
-    logging.info("Skipping line")
+    self.logger.info("Skipping line")
     self.row += 1
 
   def get_label_cell(self, label: str) -> str:
@@ -611,41 +635,50 @@ class SpreadsheetBuilder(object):
 
 
 if __name__ == '__main__':
+  logger: logging.Logger
   startTime = time.time()
   s: SpreadsheetBuilder
-  try:
-    page = requests.get(
-        "https://www.compass.com/listing/689-auburn-street-manchester-nh-03103/932977102909516985/")
-    listing = from_raw(page.text)
-    re = RentEstimator()
-    estimates = re.estimate(listing)
-    s = SpreadsheetBuilder(
-        listing.pretty_address,
-        ScenarioParams(
-            # Upfront expenses
-            prices=[listing.price],
-            down_payment_rates=[5],
-            closing_cost_rates=[3],
-            immediate_repair_rates=[3],
-            furnishing_costs=[10000],
+  urls = [
+      "https://www.compass.com/listing/1050-palafox-drive-northeast-atlanta-ga-30324/845726107540165857/",
+      "https://www.compass.com/listing/689-auburn-street-manchester-nh-03103/932977102909516985/",
+  ]
+  for url in urls:
+    try:
+      page = requests.get(url)
+      listing = from_raw(page.text)
+      logger = get_logger(listing.pretty_address)
 
-            # Recurring income
-            # rent_estimates=[e for e in estimates if e.type == EstimateType.AVERAGE],
-            rent_estimates=estimates,
+      re = RentEstimator(logger)
+      estimates = re.estimate(listing)
+      s = SpreadsheetBuilder(
+          listing.pretty_address,
+          ScenarioParams(
+              # Upfront expenses
+              prices=[listing.price],
+              down_payment_rates=[5],
+              closing_cost_rates=[3],
+              immediate_repair_rates=[3],
+              furnishing_costs=[10000],
 
-            # Recurring expenses
-            yearly_mortgage_rates=[3.23],
-            monthly_utility_costs=[300],
-            yearly_capex_rates=[1.25],
-            yearly_maintenance_rates=[0.5],
-            monthly_management_rate=10,
-            monthly_property_taxes=0,  # TODO
-            monthly_hoa_fees=0,  # TODO
-        ))
-    s.build_spreadsheet()
-  finally:
-    executionTime = (time.time() - startTime)
-    pprint(f"Total Sheets API calls: {s.sheets_api_calls}")
-    pprint('Execution time in seconds: ' + str(executionTime))
+              # Recurring income
+              rent_estimates=[e for e in estimates if e.type == EstimateType.AVERAGE],
+              # rent_estimates=estimates,
 
+              # Recurring expenses
+              yearly_mortgage_rates=[3.23],
+              monthly_utility_costs=[300],
+              yearly_capex_rates=[1.25],
+              yearly_maintenance_rates=[0.5],
+              monthly_management_rate=10,
+              monthly_property_taxes=0,  # TODO
+              monthly_hoa_fees=0,  # TODO
+          ),
+          logger)
+      s.build_spreadsheet()
+    except Exception as e:
+      logger.error(e)
+      continue
+
+  executionTime = (time.time() - startTime)
+  pprint('Execution time in seconds: ' + str(executionTime))
   exit(0)
