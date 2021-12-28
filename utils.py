@@ -52,28 +52,35 @@ def gspread_retry(func: Callable) -> Callable:
   return wrapper
 
 
-def get_logger(pretty_address: str) -> logging.Logger:
+def get_logger(pretty_address: str = "root") -> logging.Logger:
   '''
-  Gets a logger by the given name (pretty_address) or creates it if it doesn't exist.'
+  Gets a logger by the given name (pretty_address) or creates it if it doesn't exist, with this application's preferred logger settings.
+  If pretty_address is "root", returns the root logger logging to stdout and LOGSDIR/root.
   '''
   _existing_log = logging.Logger.manager.loggerDict.get(pretty_address)
   if _existing_log is not None and type(_existing_log) is not logging.PlaceHolder:
     existing_log = cast(logging.Logger, _existing_log)
     return existing_log
 
+  # logging.getLogger("") returns the root logger
+  logger = logging.getLogger(pretty_address)
   logdir = os.path.join(LOGSDIR, pretty_address)
+
   if not os.path.exists(logdir):
     os.makedirs(logdir)
   logfile = os.path.join(logdir, LOGFILE)
 
   formatter = logging.Formatter(LOGFMT)
-  stderrHandler = logging.StreamHandler(sys.stderr)
-  stderrHandler.setFormatter(formatter)
   fileHandler = logging.FileHandler(logfile)
   fileHandler.setFormatter(formatter)
-  logger = logging.getLogger(pretty_address)
-  logger.addHandler(stderrHandler)
+
   logger.addHandler(fileHandler)
   logger.setLevel(logging.DEBUG)  # TODO: make configurable
+
+  # The root logger should still print everything to the console.
+  if pretty_address == "root":
+    stderrHandler = logging.StreamHandler(sys.stderr)
+    stderrHandler.setFormatter(formatter)
+    logger.addHandler(stderrHandler)
 
   return logger
