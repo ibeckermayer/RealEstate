@@ -70,25 +70,23 @@ class Listing:
     {'name': 'Unit Information', 'subCategories': [{'name': 'Unit 1', 'fields': [{'key': 'Unit 1 Baths', 'values': ['1']}, {'key': 'Unit 1 Bedrooms', 'values': ['4']}, {'key': 'Unit 1 Lease Term', 'values': ['Month to Month']}, {'key': 'Unit 1 Level Number', 'values': ['1']}, {'key': 'Unit 1 Rental Amt Freq', 'values': ['Monthly']}, {'key': 'Unit 1 Rental Amount', 'values': ['$1,399.00']}, {'key': 'Unit 1 Tenant Pays', 'values': ['Electric', 'Heat', 'Hot Water']}]}, {'name': 'Unit 2', 'fields': [{'key': 'Unit 2 Lease Term', 'values': ['Annual']}, {'key': 'Unit 2 Baths', 'values': ['1']}, {'key': 'Unit 2 Level Number', 'values': ['2']}, {'key': 'Unit 2 Rental Amt Freq', 'values': ['Monthly']}, {'key': 'Unit 2 Bedrooms', 'values': ['3']}, {'key': 'Unit 2 Rental Amount', 'values': ['$1,600.00']}, {'key': 'Unit 2 Tenant Pays', 'values': ['Electric', 'Heat', 'Hot Water']}]}]}
 
     If a detail with name 'Unit Information' can't be found or bed or bath information can't be extracted from any unit
-    in precisely this format, it returns an empty list to alert the caller to try an alternative.
+    in precisely this format, it throws an IncongruentFromat warning.
     '''
     try:
       details = self.raw_listing['detailedInfo']['listingDetails']
     except KeyError as e:
-      logging.debug(
+      self.logger.debug(
           "Failed to find details from self.raw_listing['detailedInfo']['listingDetails']")
       raise self.IncongruentFormat()
 
     detail = next((d for d in details if d.get('name') == "Unit Information"), None)
     if detail is None:
-      logging.debug(
-          f"Failed to find a detail where detail['name'] == \"Unit Information\" in details = {details}"
-      )
+      self.logger.debug(f"Failed to find a detail where detail['name'] == \"Unit Information\"")
       raise self.IncongruentFormat()
 
     sub_categories = detail.get('subCategories')
     if sub_categories is None:
-      logging.debug(f"Failed because detail.get('subCategories') == None for detail = {detail}")
+      self.logger.debug(f"Failed because detail.get('subCategories') == None for detail = {detail}")
       raise self.IncongruentFormat()
 
     units: list[Unit] = []
@@ -113,11 +111,11 @@ class Listing:
       '''
       name = sc.get('name')
       if name is None:
-        logging.debug(f"Failed because sc.get('name') == None for sc = {sc}")
+        self.logger.debug(f"Failed because sc.get('name') == None for sc = {sc}")
         raise self.IncongruentFormat()
       match = re.match("^Unit \d+", name)  # Look for "Unit 1", "Unit 2", etc.
       if match is None:
-        logging.debug(
+        self.logger.debug(
             f"Failed because match = re.match(\"^Unit \\d+\", name) == None for name = {name}")
         raise self.IncongruentFormat()
       unit_n_string = match.string  # This string is "Unit 1", "Unit 2", etc.
@@ -144,18 +142,111 @@ class Listing:
 
     return units
 
+  def _units_from_Multi_Family(self) -> list[Unit]:
+    '''
+    Extracts unit info from a detail in self.raw_listing['detailedInfo']['listingDetails'] that looks like:
+    {'name': 'Multi Family', 'subCategories': [{'name': 'Multi-Family Information', 'fields': [{'key': 'Unit Count', 'values': ['2']}, {'key': 'NUM OF UNITS', 'values': ['2']}]}, {'name': 'Income & Expenses Information', 'fields': [{'key': 'Gross Annual Income', 'values': ['$0']}, {'key': 'N.O.I. $', 'values': ['$.00']}, {'key': 'Annual Expenses', 'values': ['$0']}]}, {'name': 'Unit 1', 'fields': [{'key': 'Unit Rent Amount', 'values': ['$1,300.00']}, {'key': 'Unit Full Baths', 'values': ['1']}, {'key': 'Unit Bedrooms', 'values': ['2']}, {'key': 'Unit Available Date', 'values': ['08-31-2021 08:00:00 PM']}, {'key': 'Unit Deposit Amount', 'values': ['$.00']}, {'key': 'Unit Features', 'values': ['Deck', 'Dishwasher', 'Hardwood Floors', 'Range/Oven']}, {'key': 'Unit Garbage Included', 'values': ['Yes']}, {'key': 'Unit Gas Included', 'values': ['No']}, {'key': 'Unit Half Baths', 'values': ['0']}, {'key': 'Unit Maintenance Included', 'values': ['No']}, {'key': 'Unit Occupant', 'values': ['Avail In 1-3 Mon']}, {'key': 'Unit Water Included', 'values': ['No']}, {'key': 'Unit Electric Included', 'values': ['No']}]}, {'name': 'Unit 2', 'fields': [{'key': 'Unit Rent Amount', 'values': ['$1,300.00']}, {'key': 'Unit Full Baths', 'values': ['1']}, {'key': 'Unit Bedrooms', 'values': ['2']}, {'key': 'Unit Available Date', 'values': ['08-31-2021 08:00:00 PM']}, {'key': 'Unit Deposit Amount', 'values': ['$1,300.00']}, {'key': 'Unit Features', 'values': ['Deck', 'Dishwasher', 'Hardwood Floors', 'Range/Oven']}, {'key': 'Unit Garbage Included', 'values': ['Yes']}, {'key': 'Unit Gas Included', 'values': ['No']}, {'key': 'Unit Half Baths', 'values': ['0']}, {'key': 'Unit Maintenance Included', 'values': ['No']}, {'key': 'Unit Occupant', 'values': ['Avail In 1-3 Mon']}, {'key': 'Unit Water Included', 'values': ['No']}, {'key': 'Unit Electric Included', 'values': ['No']}]}]}
+
+    If a detail with name 'Unit Information' can't be found or bed or bath information can't be extracted from any unit
+    in precisely this format, it throws an IncongruentFromat warning.
+    '''
+    try:
+      details = self.raw_listing['detailedInfo']['listingDetails']
+    except KeyError as e:
+      self.logger.debug(
+          "Failed to find details from self.raw_listing['detailedInfo']['listingDetails']")
+      raise self.IncongruentFormat()
+
+    detail = next((d for d in details if d.get('name') == "Multi Family"), None)
+    if detail is None:
+      self.logger.debug(
+          f"Failed to find a detail where detail['name'] == \"Multi Family\" in details = {details}"
+      )
+      raise self.IncongruentFormat()
+
+    sub_categories = detail.get('subCategories')
+    if sub_categories is None:
+      self.logger.debug(f"Failed because detail.get('subCategories') == None for detail = {detail}")
+      raise self.IncongruentFormat()
+
+    units: list[Unit] = []
+    for sc in sub_categories:
+      '''
+      Looking for beds an dbaths in e.g.
+      sc = {
+              "name": "Unit 1",
+              "fields": [
+                { "key": "Unit Rent Amount", "values": ["$1,300.00"] },
+                { "key": "Unit Full Baths", "values": ["1"] },
+                { "key": "Unit Bedrooms", "values": ["2"] },
+                {
+                  "key": "Unit Available Date",
+                  "values": ["08-31-2021 08:00:00 PM"]
+                },
+                { "key": "Unit Deposit Amount", "values": ["$.00"] },
+                {
+                  "key": "Unit Features",
+                  "values": ["Deck", "Dishwasher", "Hardwood Floors", "Range/Oven"]
+                },
+                { "key": "Unit Garbage Included", "values": ["Yes"] },
+                { "key": "Unit Gas Included", "values": ["No"] },
+                { "key": "Unit Half Baths", "values": ["0"] },
+                { "key": "Unit Maintenance Included", "values": ["No"] },
+                { "key": "Unit Occupant", "values": ["Avail In 1-3 Mon"] },
+                { "key": "Unit Water Included", "values": ["No"] },
+                { "key": "Unit Electric Included", "values": ["No"] }
+              ]
+            },
+      '''
+      name = sc.get('name')
+      if name is None:
+        self.logger.debug(f"Failed because sc.get('name') == None for sc = {sc}")
+        raise self.IncongruentFormat()
+      match = re.match("^Unit \d+", name)  # Look for "Unit 1", "Unit 2", etc.
+      if match is None:
+        # It's valid for some subcategories not to match, if we encounter those just continue.
+        self.logger.debug(
+            f're.match("^Unit \\d+", name) failed for name = {name}; not an error, continuing')
+        continue
+      fields = sc.get('fields')
+      if not fields:
+        self.logger.debug(f"sc.get('fields') == None for sub_category (sc) = {sc}")
+        raise self.IncongruentFormat()
+      # field = { "key": "Unit 1 Bedrooms", "values": ["4"] } should make beds_vals = ["4"]
+      beds_vals = next(
+          (field.get("values") for field in fields if field.get("key") == "Unit Bedrooms"), None)
+      baths_vals = next(
+          (field.get("values") for field in fields if field.get("key") == "Unit Full Baths"), None)
+      half_baths_vals = next(
+          (field.get("values") for field in fields if field.get("key") == "Unit Half Baths"), None)
+      if beds_vals is None or baths_vals is None or half_baths_vals is None or len(
+          beds_vals) != 1 or len(baths_vals) != 1 or len(half_baths_vals) != 1:
+        # If anything unexpected happened, we alert the caller that we didn't find our detail format.
+        self.logger.debug(
+            f"(beds_vals is None or baths_vals is None or half_baths_vals is None or len(beds_vals) != 1 or len(baths_vals) != 1  or len(half_baths_vals) != 1 for beds_vals = {beds_vals}, baths_vals = {baths_vals}, half_baths_vals = {half_baths_vals}"
+        )
+        raise self.IncongruentFormat()
+
+      beds = float(beds_vals[0])
+      baths = float(baths_vals[0]) + float(half_baths_vals[0])
+      units.append(Unit(beds, baths))
+
+    return units
+
   @cached_property
   def units(self) -> list[Unit]:
     '''
-    TODO: multi family info may be laid out differently i.e.: https://www.compass.com/listing/1050-palafox-drive-northeast-atlanta-ga-30324/845726107540165857/
+    Tries to extract unit information from the raw listing by trying each of the known formats.
+    If the raw listing is incongruent with any of the known formats, raises an exception.
     '''
     units: Optional[list[Unit]] = None
-    for func in [self._units_from_Unit_Information]:
+    for unit_extractor in [self._units_from_Unit_Information, self._units_from_Multi_Family]:
       try:
-        units = func()
+        units = unit_extractor()
+        break
       except self.IncongruentFormat:
         continue
-    if units is None:
+    if units is None or len(units) == 0:
       self.logger.debug(f"Unit extraction failed for self.raw_listing = {self.raw_listing}")
       raise Exception("Failed to find a known format for extracting unit info")
 
@@ -326,7 +417,7 @@ class RentEstimator(object):
         address_box.send_keys(listing.pretty_address)
         self.logger.info(f"Entered {listing.pretty_address} into the address box")
 
-        beds_selector.select_by_value(str(unit.beds))  # "1" = 1 bed, "2" = 2 beds, etc.
+        beds_selector.select_by_value(str(int(unit.beds)))  # "1" = 1 bed, "2" = 2 beds, etc.
         self.logger.info(f"Selected {unit.beds} for \"Beds\"")
 
         # <option value="">Any</option>
@@ -416,12 +507,6 @@ class RentEstimator(object):
         with open(estimate_cache_file, 'wb') as f:
           self.logger.info(f"Caching estimates at {estimate_cache_file}")
           pickle.dump(self.estimates, f)
-      else:
-        # If we made it here without estimates, we encountered something unexpected.
-        self.logger.debug(
-            f"browser.find_elements_by_class_name(\"box-stats\") = {self.browser.find_elements_by_class_name('box-stats')}"
-        )
-        raise Exception("Encountered unexpected error when estimating rents on Rentometer")
       self._nuke_tor_browser()
 
     return self.estimates
@@ -689,13 +774,14 @@ if __name__ == '__main__':
   s: SpreadsheetBuilder
   urls = [
       "https://www.compass.com/listing/1050-palafox-drive-northeast-atlanta-ga-30324/845726107540165857/",
-      "https://www.compass.com/listing/689-auburn-street-manchester-nh-03103/932977102909516985/",
+      # "https://www.compass.com/listing/689-auburn-street-manchester-nh-03103/932977102909516985/",
   ]
   for url in urls:
     try:
       page = requests.get(url)
       listing = from_raw(page.text)
       logger = get_logger(listing.pretty_address)
+      logger.info(f"Units at {listing.pretty_address}: {listing.units}")
 
       rent_estimator = RentEstimator(logger)
       estimates = rent_estimator.estimate(listing)
