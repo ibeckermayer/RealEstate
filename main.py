@@ -17,8 +17,6 @@ from types_ import Percentage, DollarAmount, SpreadsheetID
 from utils import calc_monthly_mortgage_payment, calc_down_payment, gspread_retry, get_logger
 from functools import cache, cached_property
 
-inspect.ismethod
-
 
 @dataclass
 class Unit:
@@ -28,11 +26,13 @@ class Unit:
 
 class Listing:
   '''
-  Listing is a single listing.
+  Listing is a single listing. You can optionally pass a list of units (i.e. if units can't be
+  extracted from the raw_listing)
   '''
-  def __init__(self, raw_listing: dict):
+  def __init__(self, raw_listing: dict, units: list[Unit] = None):
     self.raw_listing = raw_listing
     self.logger = get_logger(self.pretty_address)
+    self._units = units
 
     # The following line causes all @property's and @cached_property's to
     # evaluate immediately, which will cause any uknown data structures
@@ -239,6 +239,10 @@ class Listing:
     Tries to extract unit information from the raw listing by trying each of the known formats.
     If the raw listing is incongruent with any of the known formats, raises an exception.
     '''
+    if self._units:
+      self.logger.debug(f'Skipping unit extraction and using the passed in units: {self._units}')
+      return self._units
+
     units: Optional[list[Unit]] = None
     for unit_extractor in [self._units_from_Unit_Information, self._units_from_Multi_Family]:
       try:
@@ -255,7 +259,7 @@ class Listing:
     return units
 
 
-def from_raw(raw: str) -> Listing:
+def from_raw(raw: str, units: list[Unit] = None) -> Listing:
   '''
   from_raw takes in the raw webpage returned by an indivudal compass multi-family
   listing and extracts the raw listing information from the javascript.
@@ -263,7 +267,7 @@ def from_raw(raw: str) -> Listing:
   logging.info("Extracting raw listing")
   return Listing(
       json.loads(raw.split("window.__PARTIAL_INITIAL_DATA__ = ")[1].split("</script>")[0].strip())
-      ['props']['listingRelation']['listing'])
+      ['props']['listingRelation']['listing'], units)
 
 
 class EstimateType(enum.Enum):
@@ -370,7 +374,7 @@ class RentEstimator(object):
     # Close the browser and kill TOR.
     self.logger.info("Closing the browser and killing TOR")
     try:
-      self.browser.close()
+      self.browser.quit()
     except AttributeError:
       # self.browser wasn't set
       pass
@@ -398,11 +402,28 @@ class RentEstimator(object):
 
     self.estimates = []
 
+    def add_estimate(estimate_type: EstimateType, unit: Unit, monthly_rent: DollarAmount):
+      '''
+      Helper function for adding a RentEstimatedUnit to the self.estimates
+      '''
+      # Get the estimate for this type if it already exists, or create a new one
+      estimate = next((e for e in self.estimates if e.type == estimate_type),
+                      RentEstimate([], estimate_type))
+      # Append the RentEstimatedUnit
+      estimate.units.append(RentEstimatedUnit(unit, monthly_rent))
+      # If we created a new estimate above, append it to self.estimates.
+      # Otherwise, we already updated the estimate in self.estimates so we
+      # don't need to do anything.
+      if estimate not in self.estimates:
+        self.estimates.append(estimate)
+
     try:
       self.tor, self.browser = self._get_unthrottled_tor_browser()
-      for unit in listing.units:
-        self.logger.info(f"Estimating rent for unit: {unit}")
 
+      def enter_listing_info_and_click_analyze(pretty_address: str, beds: float, baths: float):
+        '''
+        baths <= 0 will select "Any" for the number of bathrooms
+        '''
         # Find the relevant UI elements
         analyze_button = self.browser.find_element_by_name("commit")
         if analyze_button.get_attribute("disabled") == "true":
@@ -414,41 +435,73 @@ class RentEstimator(object):
         beds_selector = Select(self.browser.find_element_by_id("address_unified_search_bed_style"))
         baths_selector = Select(self.browser.find_element_by_id("address_unified_search_baths"))
 
-        address_box.send_keys(listing.pretty_address)
-        self.logger.info(f"Entered {listing.pretty_address} into the address box")
+        address_box.send_keys(pretty_address)
+        self.logger.info(f"Entered {pretty_address} into the address box")
 
-        beds_selector.select_by_value(str(int(unit.beds)))  # "1" = 1 bed, "2" = 2 beds, etc.
-        self.logger.info(f"Selected {unit.beds} for \"Beds\"")
+        beds_selector.select_by_value(str(int(beds)))  # "1" = 1 bed, "2" = 2 beds, etc.
+        self.logger.info(f"Selected {beds} for \"Beds\"")
 
         # <option value="">Any</option>
         # <option value="1">1 Only</option>
         # <option value="1.5">1½ or more</option>
-        if unit.baths == 1:
+        if baths == 1:
           baths_selector.select_by_value("1")
           self.logger.info(f"Selected \"1 Only\" for \"Baths\"")
-        elif unit.baths > 1:
+        elif baths > 1:
           baths_selector.select_by_value("1.5")
           self.logger.info(f"Selected \"1½ or more\" for \"Baths\"")
         else:
-          raise ValueError(f"Unexpected number of baths: {unit.baths}")
+          baths_selector.select_by_value("")
+          self.logger.info(f"Selected \"Any\" for \"Baths\"")
 
         # Click analyze button to get analysis (typically opens a new page).
         self.logger.info("Clicking the analyze button")
         analyze_button.click()
 
-        # Check that rentometer was able to find enough results.
+      class NotEnoughResults(Exception):
+        pass
+
+      def check_not_enough_results():
+        '''
+        raises NotEnoughResults if we get the "sorry not enough results" warning from rentometer,
+        returns otherwise
+        '''
         try:
           if "Sorry, there are not enough results in that location to generate a valid analysis." in self.browser.find_element_by_xpath(
               "/html/body/div[3]/div").text:
-            self.logger.error(
-                "\"Sorry, there are not enough results in that location to generate a valid analysis.\""
+            self.logger.warning(
+                f"Rentometer says: \"Sorry, there are not enough results in that location to generate a valid analysis.\" for {unit}"
             )
+            self.logger.info("Retrying with \"Any\" for the number of bathrooms")
             # TODO all the above logic should be wrapped in a try logic, if the exception that will be thrown here is caught then
             # we should retry with "Any" baths.
-            continue
+            raise NotEnoughResults
         except NoSuchElementException:
           # This is the happy path.
           self.logger.info("Analysis succeeded")
+
+      for unit in listing.units:
+        self.logger.info(f"Estimating rent for unit: {unit}")
+        enter_listing_info_and_click_analyze(listing.pretty_address, unit.beds, unit.baths)
+        # Check that rentometer was able to find enough results.
+        try:
+          check_not_enough_results()
+        except NotEnoughResults:
+          self.logger.info("Retrying with \"Any\" for the number of bathrooms")
+          enter_listing_info_and_click_analyze(listing.pretty_address, unit.beds, -1)
+          try:
+            check_not_enough_results()
+          except NotEnoughResults:
+            # This is the happy path.
+            self.logger.error("Analysis failed with \"Any\" as the number of bathrooms")
+            self.logger.debug(
+                "Setting the rent estimates for this unit at 0 and continuing with analysis")
+            for estimate_type in [
+                EstimateType.AVERAGE, EstimateType.MEDIAN, EstimateType.PERCENTILE_25,
+                EstimateType.PERCENTILE_75
+            ]:
+              add_estimate(estimate_type, unit, 0)
+              continue
 
         # Now we're on the analysis page.
         stats: list[WebElement] = self.browser.find_elements_by_class_name("box-stats")
@@ -464,37 +517,21 @@ class RentEstimator(object):
         for stat in stats:
           if 'AVERAGE' in stat.text:
             average = extract_dollar_value(stat)
-            estimate = next((e for e in self.estimates if e.type == EstimateType.AVERAGE),
-                            RentEstimate([], EstimateType.AVERAGE))
-            estimate.units.append(RentEstimatedUnit(unit, average))
-            if estimate not in self.estimates:
-              self.estimates.append(estimate)
+            add_estimate(EstimateType.AVERAGE, unit, average)
           elif 'MEDIAN' in stat.text:
             median = extract_dollar_value(stat)
-            estimate = next((e for e in self.estimates if e.type == EstimateType.MEDIAN),
-                            RentEstimate([], EstimateType.MEDIAN))
-            estimate.units.append(RentEstimatedUnit(unit, median))
-            if estimate not in self.estimates:
-              self.estimates.append(estimate)
+            add_estimate(EstimateType.MEDIAN, unit, median)
           elif '25TH PERCENTILE' in stat.text:
             twenty_fifth_percentile = extract_dollar_value(stat)
-            estimate = next((e for e in self.estimates if e.type == EstimateType.PERCENTILE_25),
-                            RentEstimate([], EstimateType.PERCENTILE_25))
-            estimate.units.append(RentEstimatedUnit(unit, twenty_fifth_percentile))
-            if estimate not in self.estimates:
-              self.estimates.append(estimate)
+            add_estimate(EstimateType.PERCENTILE_25, unit, twenty_fifth_percentile)
           elif '75TH PERCENTILE' in stat.text:
             seventy_fifth_percentile = extract_dollar_value(stat)
-            estimate = next((e for e in self.estimates if e.type == EstimateType.PERCENTILE_75),
-                            RentEstimate([], EstimateType.PERCENTILE_75))
-            estimate.units.append(RentEstimatedUnit(unit, seventy_fifth_percentile))
-            if estimate not in self.estimates:
-              self.estimates.append(estimate)
+            add_estimate(EstimateType.PERCENTILE_75, unit, seventy_fifth_percentile)
           else:
             self.logger.warning(f"Unexpected stat in stats box: {stat.text}")
 
         if average == 0 or median == 0 or twenty_fifth_percentile == 0 or seventy_fifth_percentile == 0:
-          self.logger.error(
+          self.logger.warning(
               f"Could not extract at least one stat from stats box: {[s.text for s in stats]}")
     except Exception:
       self.logger.error(
@@ -768,18 +805,28 @@ class SpreadsheetBuilder(object):
                         self.sheet_num += 1
 
 
+@dataclass
+class Input:
+  url: str
+  units: Optional[list[Unit]] = None
+
+
 if __name__ == '__main__':
   logger = get_logger()
   startTime = time.time()
   s: SpreadsheetBuilder
-  urls = [
-      "https://www.compass.com/listing/1050-palafox-drive-northeast-atlanta-ga-30324/845726107540165857/",
+  inputs: list[Input] = [
+      # "https://www.compass.com/listing/1050-palafox-drive-northeast-atlanta-ga-30324/845726107540165857/",
       # "https://www.compass.com/listing/689-auburn-street-manchester-nh-03103/932977102909516985/",
+      # "https://www.compass.com/listing/315-chateau-drive-southeast-rome-ga-30161/938535030264973529/"
+      Input(
+          "https://www.compass.com/listing/265-vistawood-drive-northeast-marietta-ga-30066/953808184193214265/",
+          [Unit(2, 1), Unit(1, 1)])
   ]
-  for url in urls:
+  for input in inputs:
     try:
-      page = requests.get(url)
-      listing = from_raw(page.text)
+      page = requests.get(input.url)
+      listing = from_raw(page.text, input.units)
       logger = get_logger(listing.pretty_address)
       logger.info(f"Units at {listing.pretty_address}: {listing.units}")
 
